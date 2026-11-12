@@ -6,7 +6,7 @@ single-player game: it reads the game state, gives the same orders as the GUI bu
 screen-share setup, and helper scripts to start and stop everything.
 
 > **Unofficial.** Not affiliated with Paradox Interactive. You need your own legally owned copy of the game. Single-player only.
-> No game data is included. See [NOTICE.md](NOTICE.md). Licence: MIT ([LICENSE](LICENSE)).
+> No game data is included. See [NOTICE.md](NOTICE.md). Licence: Unlicense, public domain ([LICENSE](LICENSE)).
 
 ## How it fits together
 ```
