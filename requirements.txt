@@ -1,0 +1,6 @@
+# tested set (Python 3.14.4)
+mcp==2.3.0
+anyio==4.16.0
+python-xlib==0.33        # blocker watch / tools/xin.py only
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1

@@ -1,0 +1,266 @@
+EU4 1.37.5 Linux: DIPLOMACY and WAR/PEACE catalogue (static RE, nothing was run)
+=================================================================================
+Legend: CONFIRMED = seen in disassembly (fn@addr+off); UNSURE = inferred / partially seen (what was seen is stated).
+Addresses are absolute (non-PIE). "vptr+X" = offset from the object's vptr (= _ZTV+0x10). Disassembly scratch: re/out/d/*.txt.
+ABI facts used below (CONFIRMED unless noted):
+ - CCountryTag = 8 bytes, passed/returned in one register: bytes0-2 ASCII tag, byte3 unused, int16 country index at bytes 4-5, byte7 = "valid" flag
+   (CDiplomaticAction::IsSelectable@0x11b1882+0x11 returns false at once when action byte +0x13 or +0x23, i.e. byte7 of tag1/tag3, is 0). Build tags with
+   CCountryDataBase::GetTag(char const*,bool)@0xf514c8 or copy country+0x1c; never hand-craft (CreateEmptyAction uses 0x2d2d2d="---" as null tag).
+ - CEU3Date = int32 by value in a register (current date = gs+0x1da0; "null date" constant = 0x29c77f8). When the param is `CEU3Date const&` pass a pointer.
+ - CFixedPoint (int32 x1000) is passed BY POINTER (rsi/rdx..), e.g. CSendGiftAction::SetMoney@0x11fface does `mov eax,[rsi]`; ctor COfferLoan gets `lea r8,[rsp+0x10]`.
+   Functions returning CFixedPoint/CString/CArray by value use sret in rdi. Functions below returning int (GetWarScore, GetWarScoreCost, WillAIAccept...) return in eax.
+ - CString = std::__cxx11::string layout (0x20 bytes: ptr,len,cap/sso[16]); construct with CString::CString()@0x254b128 (_ZN7CStringC2Ev) or hook-side std::string.
+ - CArray<T> = std::vector<T> (3 pointers begin,end,cap): ~CArray<CDiploChance>@0x1ab2002 is `jmp std::vector<CDiploChance>::~vector`@0x10ea700;
+   CCountry::GetCurrentWars(CArray<CWar*>&)@0x103b106 push_backs with _M_realloc_insert<CWar* const&>. Zero-init 24 bytes = empty.
+ - CPdxArray<T,int> (CONFIRMED layout, size 0x18): +0 vptr (store _ZTV...+0x10, e.g. 0x25f7888 for <CDiplomaticAction*,int>, 0x25f7ba0 for <CPdxScopedPtrImpl<CWarGoal,false>,int>;
+   CDeclareWarWithCBEffect::Execute@0x12ced7d builds one inline), +8 T* data (new[]), +0x10 int capacity, +0x14 int count. Its dtor (@0x10e846e) only
+   delete[]s the buffer, it does NOT delete pointed-to actions.
+
+A. GENERAL
+==========
+A0. Recommended generic factory (CONFIRMED; this is exactly what the diplomacy screen does)
+ CCountry::CreateValidDiplomaticActions(CCountryTag target, CPdxArray<CDiplomaticAction*,int>& out) const @0x10387c6
+   _ZNK8CCountry28CreateValidDiplomaticActionsE11CCountryTagR9CPdxArrayIP17CDiplomaticActioniE ; this = ACTOR country (CCountry*), called from
+   CCountryDiplomacyView::UpdateActionList@0x1a7132c+0x12f. Loops ~116 AddDiplomaticActionIfValid(id, target, status, value, scriptedDef, out)@0x1038754: each calls
+   CCountry::IsDiplomaticActionValid(id,target,CDiplomacyStatus const*,bool value,def)@0x1036efc (cheap pre-check, no object), then CreateEmptyAction, then writes
+   +0xc=+0x14=actor tag(this+0x1c), +0x1c=target, calls vptr+0xe8 SetValue(value), Append. 116 (id,value) pairs: 87 value=true, 29 value=false (= "cancel/revoke/leave" twins).
+ CCountry::CreateDiplomaticAction(int id, CCountryTag target, bool value, CScriptableDiplomaticActionDefinition const* def) const @0x1036eb2
+   _ZNK8CCountry22CreateDiplomaticActionEi11CCountryTagbPK37CScriptableDiplomaticActionDefinition  (this=actor; id = the action's GetToken() value, see table B; def=nullptr except id 0x3662).
+   It = CreateEmptyAction(id,def)@0xf9fa48 (big switch on id -> new + ctor with "---" tags and null date) + the four stores above. Returned object is heap (operator new) and UNOWNED: free with vptr+8.
+   Date fields +0x24/+0x28 stay 0x29c77f8 (null) -> set +0x24 = gs+0x1da0 yourself (OnAccept does, A1).
+ Freed by GUI: elements deleted through [vptr+8] (UpdateActionList@0x1a71678.. `call [rax+8]`), array dtor does not.
+ Per-object introspection for a Python catalogue: GetToken vptr+0xa0 (id), name key vptr+0xf0 (sret CString, e.g. "ALLIANCE" / "CANCELALIANCE"), IsSelectable vptr+0x90, DoUseDiplomat vptr+0x108,
+ IsSpyAction vptr+0x110, RequireAcceptance vptr+0xd8, IsAutoAccept vptr+0xf8, WillAIAccept vptr+0xc0, GetAIAcceptanceDerived vptr+0x128, Clone vptr+0xb8, deleting dtor vptr+8.
+ Vtable (vptr+): 0x00 D1 | 0x08 D0(deleting) | 0x48 CreateCommand(sret unique_ptr) | 0x50 ExecuteDerived | 0x58 GetActiveProvince | 0x60 GetName(=NameKey+"TITLE") | 0x70 GetDescription |
+   0x88 IsValid(CString*,bool) pure | 0x90 IsSelectable(CString*,bool) | 0x98 IsGUISelectable(CString*,bool) | 0xa0 GetToken pure | 0xa8 GetCategoryToken | 0xb0 IsNull |
+   0xb8 Clone | 0xc0 WillAIAccept | 0xc8 GetAIAcceptance | 0xd0 GetAIDesire(bool) | 0xd8 RequireAcceptance | 0xe0 CreateDiplomaticDialog(CEU3Idler*) | 0xe8 SetValue(bool) |
+   0xf0 NameKey(sret CString) | 0xf8 IsAutoAccept | 0x100 IsMaintainedDiplomat | 0x108 DoUseDiplomat | 0x110 IsSpyAction | 0x128 GetAIAcceptanceDerived(CArray<CDiploChance>*,bool) | 0x130 GetScriptedScope.
+   (derived from re/out/vt_CDiplomaticAction.txt: raw slot offset - 0x10; cross-checked by call sites: Idle@0x147be7e uses +0xd8,+0xf8,+0xb8,+0xe0; AddIncomingAction@0x1039657 uses +0xb0,+0xd8.)
+ Object layout (CONFIRMED from base ctor @0x11b05d4 and inlined derived ctors): +8 int 0x165 | +0xc tag1 (actor) | +0x14 tag2 (actor again for non-3-party actions) | +0x1c tag3 (recipient/target) |
+   +0x24 date (sent) | +0x28 date (command date) | +0x2c int | +0x30 EType | +0x34 byte value (true=do, false=cancel variant) | +0x35 byte | +0x38 uint incoming-id | derived fields from +0x3c.
+   Base ctor signature (CCountryTag,CCountryTag,CCountryTag,CEU3Date const&,EType,int,bool): arg order tag1,tag2,tag3,date,EType(r9),int(stack1)->+0x2c,bool(stack2)->+0x34.
+   Derived ctors (single-actor) store tag1=tag2=first arg, tag3=second arg, EType=0, +0x2c=-1, +0x34=1 (value), +0x38=0.
+ EType (CONFIRMED by use): 0 = new request, 1 = declined, 2 = accepted. (CDiplomaticActionCommand::Execute@0x11af925: cmp eax,2 / cmp eax,1 / test eax; dialogs write 2 and 1.)
+
+A1. GUI send sequence (CONFIRMED)
+ CStandardDiplomacyDialogue::OnAccept@0x1a7115c (dialogs inherit it; CDeclareWarDialogue::OnAccept ends in `jmp` to it, CCallAllyDiplomacyDialogue::OnAccept@0x1a7c9f0 is a bare `jmp`):
+   1. action = *(dlg+0x250) (dialog owns it; destroyed in ~CStandardDiplomacyDialogue@0x1a70fb8+0x2d via `call [vptr+8]`).
+   2. only for tokens 0x293d,0x3b85,0x331d,0x3320 (alliance, invite HRE, invite trade league, request join trade league) and 0x293c: stores gs+0x1d60=date, gs+0x1d64=action+0xc (0x1d6c/0x1d70 for peace) = last-pact-offer bookkeeping.
+   3. if token==0x294d (call ally) and IsControllerAI(action+0x1c): action byte +0x4c = 0.
+   4. *(uint*)(action+0x24) = gs+0x1da0 (current date)  [@0x1a7128c]. EType (+0x30) is NOT touched (stays 0). +0x28 is set later by CreateCommand.
+   5. session = (*(dlg+0x248))->vtbl[0x88]() (CInGameIdler::GetSession); up = action->vptr+0x48 CreateCommand(&up) (clone+date+0x50-byte CDiplomaticActionCommand holding the clone at +0x48; @0x11af14c).
+   6. CSession::Post(unique_ptr)@0x200690a (moves pointer out). Leftover non-null unique_ptr is deleted via [vptr+8] (CCommand deleting dtor). The ORIGINAL action stays owned by the dialog.
+   7. CCountryDiplomacyView::UpdateActionList(action+0x1c); ShowMainWindow(); CEU3Dialog::OnAccept().
+ NO IsValid/IsSelectable call inside OnAccept: validation happens before, when the button list is built/refreshed:
+   CDiplomaticActionItem::Update@0x1a8239e+0x270 calls IsGUISelectable(CString*=nullptr, bool=false) [vptr+0x98] (enables/greys the button); tooltip @0x1a81a8c+0x17f calls IsGUISelectable(&text,false).
+   Base IsGUISelectable@0x11b15f6 = IsSelectable(why,b) [vptr+0x90, args forwarded unchanged] + appends spy-network cost text. Base IsSelectable@0x11b1882 = (actor/target valid, diplomat checks, spy cost) AND IsValid(why,false) [vptr+0x88, @+0x2cd/+0x2ec].
+   CDiplomaticActionCommand::IsValid@0x11b03aa / Execute@0x11af8dc call action->IsValid(nullptr,false) [Execute +0x1a..0x1e]. So all in-game callers pass bool=false.
+   Meaning of the bool in IsSelectable(why,b) (CONFIRMED from @0x11b1b58): b=true SKIPS the free-diplomat / diplomat-en-route check ("ignore diplomat"). The bool of IsValid(why,b) is unused in
+   CImproveRelationAction::IsValid@0x12359e2 and CDeclareWarAction::IsValid@0x11cd2b6 (UNSURE for the rest; always false from the game).
+   Declare-war dialog extras: SelectWarGoal@0x1a7579c calls CDeclareWarAction::SetWarGoal(goal) and, if !CCasusBelliType::CanAttackerDemandLand, ClearAttackerCallAllies+ClearAttackerAlliesPromisedLand.
+   Other dialogs: CSendGiftDialogue::OnAccept@0x1a7bd24 = SetMoney(CFixedPoint from text box) then CStandardDiplomacyDialogue::OnAccept; CSendInsultDialogue::OnAccept@0x1a7a728 = SetInsult;
+   CThreatenWarDialog::OnAccept@0x1c05bf6 = SetProvince(int)+SetTaker(tag); CFabricateClaimDialogue::OnAccept@0x1bf8e80 = copy-ctor of the action, SetProvince(CProvince*), IsValid-style session fetch,
+   CreateCommand, Post, `delete copy` via [vptr+8] (does not use the dialog-owned object).
+ Incoming-proposal dialogs: CDiplomaticActionDialog::OnAccept@0x1bed8a4 / DoDecline@0x1bed9b8, see A5.
+ Destruction: deleting dtor = vptr+8 (CONFIRMED: _ZN15CAllianceActionD0Ev@0x1270de2 is `jmp operator delete`; used by every GUI/AI site). CreateCommand clones, so the hook may free its action immediately after Post.
+ Auto-accept/AI-side proof of the 4-step recipe (CInGameIdler::Idle@0x147be8c..0x147bee1): Clone [+0xb8] -> set +0x30=2 -> CreateCommand [+0x48] -> Post -> delete clone [+8].
+
+A2. CDiploChance and the acceptance list (CONFIRMED)
+ sizeof(CDiploChance)=0x30: +0 int32 value (plain integer; printed with CString(int) in GetAcceptanceReason@0x11b0a3a+0x2a0; e.g. -1000 = 0xfffffc18 in CalculateAllianceDesireability@0xfc08d6),
+ +8 CString reason (already LOCALISED text built with PdxLocalize<...> and country names, not a key; ptr at +8, len +0x10, sso buf +0x18), +0x28 byte flag (partitions the entries into two printed groups in
+ GetAcceptanceReason; set to 1 at 1 of ~5 sites in CalculateAllianceDesireability@0xfc0bce -> UNSURE meaning). Appended by std::vector<CDiploChance>::emplace_back(CDiploChance&&)@0xea0a28.
+ Container = std::vector<CDiploChance> (CArray<CDiploChance>): GUI init `movaps [rdi],xmm0(0); mov [rdi+0x10],0` then reserve(0x14 or 0x28) (@0x1a81b47, WillAIAccept@0x11b1ccb).
+ WillAIAccept(CArray<CDiploChance>* list) const @0x11b1c9a (_ZNK17CDiplomaticAction12WillAIAcceptEP6CArrayI12CDiploChanceE) = vptr+0x128 GetAIAcceptanceDerived(list, list!=0) > 0 (int return; int>0 accepts).
+   With list==nullptr it uses a TLS temp vector. The list is NOT cleared by the callee (WillAIAccept clears only its own TLS one) -> pass an empty vector. The int itself (sum of values) is only obtainable by calling vptr+0x128 directly.
+   Cheat flag: if gs+0x2349 !=0 and the actor IsLocalPlayer, CAllianceAction/CRequestPeaceAction::GetAIAcceptanceDerived@0x11d86ce/0x1258de4 return 99999 (0x1869f) (UNSURE what sets gs+0x2349).
+ Tooltip text builder: CDiplomaticAction::GetAcceptanceReason(CArray<CDiploChance> const*, bool) const @0x11b0a28 (_ZNK17CDiplomaticAction19GetAcceptanceReasonEPK6CArrayI12CDiploChanceEb): sret CString in rdi, rsi=this, rdx=list, ecx=bool
+   -> forwards to static GetAcceptanceReason(CCountryTag recipient=this+0x1c, list, bool)@0x11b0a3a (sorts entries, prints "reason: +/-value"; bool meaning UNSURE).
+ Free: call CArray<CDiploChance>::~CArray()@0x1ab2002 (_ZN6CArrayI12CDiploChanceED2Ev; destroys each CString then delete[]-free of buffer with operator delete) or do the same by hand:
+   for e in [begin,end) step 0x30: if (*(char**)(e+8) != e+0x18) operator delete(*(void**)(e+8)); then operator delete(begin) if begin. (@0x10ea700 body.) The vector object itself is not heap (stack in the GUI).
+
+A3. IsValid / IsSelectable reason string (CONFIRMED)
+ The CString* is OPTIONAL: every override tests it (`test r14,r14; je` in CImproveRelationAction::IsValid@0x1235a38/0x1235aaa; IsSelectable `test r15,r15`). Pass nullptr when only the bool is needed.
+ When non-null the callee APPENDS localised, colour-marked text, never a key: PdxLocalizeAndReplace(KEY,...)@0x1feeaaf then CreateGreenRedText(CString* out, CString const& text, bool green)@0x2012829
+ (operator+= with colour codes; false = red). Newline separation via CString::AddNewlineIfNeeded()@0x254d360 (seen in CRequestPeaceAction::IsGUISelectable@0x1258a50). A failing check appends one line per failing reason
+ (IsValid keeps going and ANDs results, e.g. ImproveRelation: ATWARWITHUS / IS_IMPROVE_RELATIONS), so pass an empty CString and read it back. Loc keys seen: ATWARWITHUS, NODIPLOMATS(0x26182f8), IS_IMPROVE_RELATIONS.
+
+A4. Diplomat requirement (CONFIRMED)
+ Predicate on the object: vptr+0x108 DoUseDiplomat(). Base implementation @0x11b1fca; overrides read byte [+0x34] (the `value`) for the toggle-type actions. Evaluated per class (re/out/d/vt_out.txt):
+   Needs a diplomat (DoUseDiplomat const true): Abandon Union, Alliance, AppointCardinal, AskForMarch, AskForTributaryState, AskKnowledgeSharing, CallCrusade, CharterCompany, ClaimThrone, ConvertTributaryToVassal,
+   DeclareWar, DemandUnlawfulTerritory, DesignateMarch, Embargo, Excommunicate, FleetBasingRights, FormCoalition, GrantElectorate, GrantFreeCity, Guarantee, ImperialRealmWar, ImperialRelations, InfluenceNation, Insult,
+   InviteToFederation/HRE/TradeLeague, KnowledgeSharing, MilitaryAccess, OfferFleetBasing, OfferLoan, OfferMilitaryAccess, ReligiousUnity, Remove{Electorate,FreeCity}, RequestToJoin{Federation,TradeLeague},
+   ReturnCoreFavor, RoyalMarriage, Scriptable, SellProvince, SellShips, SendGift, SendWarning, ShareMap, SteerTrade, SupportIndependence, TakeOnDebt, ThreatenWar, TradeFavorsFor*, TransferTradePower, TributaryState,
+   UnconditionalSurrender, Vassal, WarSubsidy, BreakAlliance{Favor,GreatPower}, ReduceRelationsFavor, EnforcePeace, InterveneInWar.
+   Only when value==true (start; the cancel twin is free): ImproveRelation, CurryFavors, DemandAnnexation, DemandIntegration, SupportHeir, BuildSpyNetwork, CounterEspionage (override = `mov al,[rdi+0x34]`).
+   RequestPeace: returns byte [+0x3c] (ctor sets 1) = needs diplomat; OfferCondottieri: byte [+0x5c].
+   No diplomat (spy actions, use spy network; IsSpyAction vptr+0x110 true; cost via GetSpyNetworkCost(CString*)@0x11b0488): Agitate, BuildSpyNetwork, ClaimState, CorruptOfficials, FabricateClaim, Infiltrate, JustifyTradeConflict,
+   SabotageRecruitment, SabotageReputation, SlanderMerchants, SowDiscontent, StealMap, SupportRebels. Also no diplomat: CallAlly, ConfirmTribute.
+ Free-diplomat test used by the GUI: local function (anonymous namespace)::HasFreeDiplomats(CCountry const&) @0x1ce0d3f (_ZN12_GLOBAL__N_116HasFreeDiplomatsERK8CCountry, a `t` symbol, not exported, call by address):
+   v = *(vector<CEnvoyMember*>*)( *(country+0x1470)+0x18 ) +0x20..+0x28 (begin/end, 8-byte entries); true if some entry m has byte [m+0x18]==0 (not busy) AND !CCountry::IsDiplomatAutomated(int [m+0x44])@0x103600e.
+   Exported pieces: CCountry::IsDiplomatAutomated(int)const, CCountry::GetAutomatedDiplomatCount()const@0x103601a (country+0x1488 -> +0x34), CCountry::HasDiplomatEnroute(CCountryTag)const@0x1036e18 (a diplomat is already travelling to that target),
+   GetDiplomatArrival(CCountryTag)const@0x1036e96. IsSelectable's own rule (@0x11b1b27..0x11b1b84): count free envoys n and automated ones a; fails with NODIPLOMATS if a>=n. Execute@0x11af8dc consumes the envoy via CEnvoy/CCountry::UseEnvoy.
+   Pending diplomat commands: CCancelDiplomatCommand(tag,int envoyId)@0xf4755a, CAutomateDiplomatCommand(tag,int,int,bool)@0xf8559a.
+
+A5. Incoming proposals for the human (CONFIRMED)
+ Container: CCountry+0x18c0 = CList<CDiplomaticAction*> (head ptr at +0x18c0; node {action* +0, prev +8, next +0x10}; list object also has tail/count). Written by CCountry::AddIncomingAction(CDiplomaticAction*)@0x1039644
+   (only if !IsNull(vptr+0xb0), EType==0, RequireAcceptance(vptr+0xd8), +0x38==0; assigns id = CGameState::GenerateID(5,..) to +0x38 and SetLastCommandDate) from CDiplomaticActionCommand::Execute@0x11afea1
+   (recipient not AI: `IsControllerAI(action+0x1c)` false -> AddIncomingAction(Clone)). AI recipients are answered immediately inside Execute (WillAIAccept vptr+0xc0 -> EType 2 else 1), nothing is queued.
+   Removed by CCountry::RemoveIncomingDiploAction(uint id)@0x10397ec (deletes via [vptr+8]) when the answer command executes (Execute@0x11afd57 tries proposer's country then +0x20 target's), ClearIncomingActions@0xf931d2.
+   So listing without the GUI: c = player CCountry; for(n=*(void**)(c+0x18c0); n; n=*(void**)(n+0x10)){ a=*(CDiplomaticAction**)n; id=*(uint*)(a+0x38); proposer=*(tag*)(a+0xc); token=a->vptr+0xa0(); }
+   Peace offers to the human arrive the same way (token 0x293c, CRequestPeaceAction); enforce-peace requests too (0x2dda).
+ GUI consumer: CInGameIdler::Idle@0x147bd4b+ (only when gs+0x742c != 0; UNSURE meaning): prunes idler vector<CDiplomaticAction const*> at idler+0x1b20 of entries no longer in the player's list, and for each new list entry
+   with RequireAcceptance: if IsAutoAccept(vptr+0xf8) -> auto answer (clone, +0x30=2, CreateCommand, Post, delete clone) else CreateDiplomaticDialog(vptr+0xe0)(idler) -> CDiplomaticActionDialog + CDiploIcon/CAlertManager::AddDiploIcon.
+ ANSWER sequence (CDiplomaticActionDialog, action at dlg+0x330, session (*(dlg+0x10))->vtbl[0x88]):
+   accept: old=a+0x30; a+0x30=2; a->vptr+0x48(&up); CSession::Post(session,&up); delete up if non-null; a+0x30=old  [OnAccept@0x1bed8a4]
+   decline: same with a+0x30=1 [DoDecline@0x1bed9b8; CDiplomaticActionDialog::OnDecline@0x1bed946 calls vptr+0xa0 of the dialog = DoDecline].
+   Date: CreateCommand sets clone+0x28 = now; +0x24 stays the sender's date. Answer commands are Execute'd with EType 1/2: Execute removes the pending entry by +0x38 and runs ExecuteDerived (accept) or the decline path.
+   The hook can do this with the list element directly (a = list entry): save +0x30, set 2 or 1, CreateCommand, Post, restore +0x30 (do not delete `a`; the list owns it).
+
+B. PER ACTION  (class | GetToken id | ctor (mangled C1) | operator-new size | extras)  value=false = cancel twin where listed in A0
+=============
+All ctors below take (this, CCountryTag actor, CCountryTag target, CEU3Date) unless noted. The generic route CCountry::CreateDiplomaticAction(id,target,value,nullptr) avoids ctors altogether.
+Name keys (vptr+0xf0): value=true / value=false variant.
+
+DECLARE WAR  CDeclareWarAction id 0x293b | _ZN17CDeclareWarActionC1E11CCountryTagS0_b8CEU3DatePK8CWarGoal @0x11c45e2 | size 0x90
+  (actor,target,bool noPenalty,date,CWarGoal const*). CONFIRMED: bool -> +0x3c; GetStabilityHit@0x11c85b2 returns 0 when it is set (script effects pass 1; GUI/CreateEmptyAction pass 0). CWarGoal cloned (CWarGoal::Clone@0x194953a) into +0x40 (null goal =
+  CNullWarGoal::_pNullWarGoal @0x2fd77d0). +0x48/+0x50 vector<SBelligerent> attacker call-to-arms list, +0x60/+0x68 attacker "promised land" list, +0x78.. defender list (zeroed by ctor; UNSURE exact roles; empty = no extra allies called by the attacker).
+  Get a goal for CB name + target province (CONFIRMED pattern from CDeclareWarWithCBEffect::Execute@0x12ced28..0x12cf2c8 and CDeclareWarDialogue::UpdateWarGoals@0x1a76644):
+    cbType = CCasusBelliDatabase::AccessInstance()->GetByKey(CString const& "cb_conquest") (_ZNK19CCasusBelliDatabase8GetByKeyERK7CString @0xecea44; key = script name in common/cb_types; falls back to CNullCasusBelliType::_pNullCB @0x2fc4678 or the first
+      entry when unknown, UNSURE which); type key CString sits at CCasusBelliType+0x10 (GetName@0xeca978 localises it).
+    CPdxArray<CPdxScopedPtrImpl<CWarGoal,false>,int> goals{vptr,0,0}; std::function<bool(CWarGoalType const*)> f{}(zeroed, empty, as the effect passes);
+    CWarGoal::CreateValidWarGoals(actor,target,cbType,&goals,false,&f) @0x194aadc (_ZN8CWarGoal19CreateValidWarGoalsE11CCountryTagS0_PK15CCasusBelliTypeR9CPdxArrayI17CPdxScopedPtrImplIS_Lb0EEiEbRKSt8functionIFbPK12CWarGoalTypeEE)
+      -> one CWarGoal per valid province/target. Pick g where g->vptr+0x110 GetCasusBelli()==cbType and g->vptr+0xd8 GetProvince() (int province id) == wanted. (The 4-arg overload @0x194a8ae enumerates all CBs the actor holds vs the target.)
+    action->SetWarGoal(g) (_ZN17CDeclareWarAction10SetWarGoalEP8CWarGoal @0x11c47fa; deletes the old goal via vptr+0x80 test + [vptr+8], clones g) ; then free the goals array entries via [vptr+8] and the array via its dtor.
+    CWarGoal vptr: +0x58 GetName +0x60 GetDesc +0x70 GetType +0x78 SetType +0xb8 SetProvince(int) +0xc0 SetCountryTag +0xd8 GetProvince +0x108 SetCasusBelli(CCasusBelliType const*) +0x110 GetCasusBelli. WAR_GOAL_TYPES factory: CWarGoal::Create(WAR_GOAL_TYPES)@0x194978e (enum values not extracted).
+    The effect then Execute()s directly; the player path is the normal CreateCommand/Post. No-CB war: keep the null goal (GUI SelectNoWarGoal@0x1a7652a).
+  Call to arms is NOT a separate command for the attacker side: DeclareWar::ExecuteDerived@0x11c53be processes the attacker belligerent vectors (lambda $_0@0x11cbf3a). Helpers: GetBelligerents(bool)@0x11ca6e8 (sret vector<SBelligerent>),
+  CreateCallToArmsAction(tag,tag,SBelligerent const&,bool,bool)@0x11cccb4, CallAlly(...)@0x11cd064, WillAiAcceptCallToArms@0x11ccf50 (SBelligerent layout NOT extracted -> UNSURE). Separate CCallAllyAction below is the mid-war call.
+  Reasons/penalties text: GetStabilityHit(CString&,bool,EStabHitReason)@0x11c859e, GetWarExhaustionHit@0x11c9ff8, GetAgressiveExpansionHit@0x11c841e, GetPietyHit@0x11ca2da (dialog OnAccept@0x1a7861a shows a confirm popup when stability hit >0).
+
+CALL ALLY  CCallAllyAction id 0x294d | _ZN15CCallAllyActionC1E11CCountryTagS0_S0_8CEU3Date13ECallAllyType9EAutoJoin16EAlwaysDefensive9EFullAlly9EUnionWar12EPromiseLand8EHolyWar19EIgnoreExistingWarsPK6CArrayIS0_E @0x1202112 | size 0x70
+  (actor, ally, tag3 -> stored at +0x3c, date, ECallAllyType int ->+0x48, then bytes: EAutoJoin->+0x4c, EAlwaysDefensive->+0x44, EFullAlly->+0x4d, EUnionWar->+0x4e, EPromiseLand->+0x4f, EHolyWar->+0x51, EIgnoreExistingWars->+0x52, vector<CCountryTag> const* -> copied to +0x58).
+  CreateEmptyAction passes ECallAllyType=1 and all enums=1, array=nullptr. GUI checkbox CCallAllyDiplomacyDialogue::ToggleCheckbox@0x1a7c96a flips +0x4f (EPromiseLand). Enum semantics UNSURE (not extracted); use CreateDiplomaticAction(0x294d,...) then edit bytes.
+  Target list: CCallAllyAction::BuildVersusList(...)@0x1201b1c. Needs no diplomat. AI answer: GetAIAcceptanceDerived@0x1206f12.
+
+ALLIANCE offer/dissolve  CAllianceAction id 0x293d | _ZN15CAllianceActionC1E11CCountryTagS0_8CEU3Date @0x11d3b06 | size 0x40 | keys ALLIANCE (value=1) / CANCELALIANCE (value=0) CONFIRMED @0x11d87d8
+  No extra args. value=false = dissolve (needs the alliance to exist, CDiplomacyStatus::HasAlliance in IsValid@0x11d763c). AI: GetAIAcceptanceDerived@0x11d86ce -> CCountry::CalculateAllianceDesireability(tag,list,bool)@0xfc07fc.
+  Break someone else's alliance (great-power/favors): CBreakAllianceGreatPowerAction id 0x3375, CBreakAllianceFavorAction id 0x3bcb, base CBreakAllianceActionBase (_ZN24CBreakAllianceActionBaseC2E11CCountryTagS0_S0_RK8CEU3Date @0x1432836, size 0x48, third tag -> +0x3c); no exported
+  derived ctors (CreateEmptyAction@0xf9fc36 calls the base ctor then stores the vptr) -> use CreateDiplomaticAction. RequireAcceptance = (EType==0). Meaning of +0x3c UNSURE (country whose alliance is broken). keys BREAKALLIANCE / BREAKALLIANCE_FAVOR.
+  CSetBreakAllianceCommand(CCountryTag,CCountryTag)@0xf74348 (_ZN24CSetBreakAllianceCommandC2E11CCountryTagS0_, size 0x58) exists as a separate command (pushes a CCountryDatePair); purpose UNSURE.
+
+ROYAL MARRIAGE offer/break  CRoyalMarriageAction id 0x28df | _ZN20CRoyalMarriageActionC1E11CCountryTagS0_8CEU3Date @0x11b387a | size 0x68 | keys MARREQ.. / BREAKRM (GetName@0x11b3936 chooses on +0x34)
+  Extras: SetOfferStatus(bool)@0x11b5d4a (_ZN20CRoyalMarriageAction14SetOfferStatusEb: CONFIRMED it ignores its arg and stores +0x34=1), SetForced(bool)@0x11b5d50 (_ZN20CRoyalMarriageAction9SetForcedEb) -> byte +0x60. value=false = break.
+  AI: GetAIAcceptanceDerived@0x11b6e34. Execute adds legitimacy (CCountry::AddLegitimacy).
+
+IMPROVE RELATIONS start/stop  CImproveRelationAction id 0x2ddb | _ZN22CImproveRelationActionC1E11CCountryTagS0_8CEU3Date @0x1234612 | size 0x40 | IMPROVERELATION / CANCEL_IMPROVERELATION
+  value=true start (needs diplomat, fails ATWARWITHUS / IS_IMPROVE_RELATIONS), value=false stop (CONFIRMED CImproveRelationAction::IsValid@0x1235a22 branches on +0x34, HasImproveRelation). Alternative stop path: CStopImproveRelationsCommand(CCountryTag,CCountryTag)
+  _ZN28CStopImproveRelationsCommandC2E11CCountryTagS0_ @0xf7b3a8 size 0x58 (Execute@0xf7b40a: GetImproveRelation()->OnDisable) used by CImproveRelationButtonDiplomatEntry. Automation: CAutomateDiplomatCommand.
+
+SEND INSULT  CInsultAction id 0x2947 | ctor A (tag,tag,date) _ZN13CInsultActionC1E11CCountryTagS0_8CEU3Date @0x11fc8be ; ctor B (tag,tag,date,CInsult const*) ...8CEU3DatePK7CInsult @0x11fc8fc | size 0x40
+  insult id int at +0x3c (-1 none); SetInsult(CInsult const*)@0x11fdfea (_ZN13CInsultAction9SetInsultEPK7CInsult) copies [insult+0xc]. Insults: CInsultDatabase::GetInstance()@0x14a86a6, GetInsult(int)@0x14a8b74, GetValidInsults(tagA,tagB,CPdxArray<CInsult const*,int>&)@0x14a8b8c,
+  GetRandomInsult(tagA,tagB,uint)@0x14a8bf4 (GUI dialog CSendInsultDialogue picks one). No revoke.
+
+GUARANTEE proclaim/revoke  CGuaranteeAction id 0x2941 | _ZN16CGuaranteeActionC1E11CCountryTagS0_8CEU3Date @0x11e4172 | 0x40 | GUARANT / REVOKEGUARANT (value=false)
+SEND WARNING  CSendWarningAction id 0x2942 | _ZN18CSendWarningActionC1E11CCountryTagS0_8CEU3Date @0x11e5e5c | 0x40 | key WARN; only value=true exists in CreateValidDiplomaticActions (no revoke action found; UNSURE if one exists elsewhere).
+MILITARY ACCESS  ask: CMilitaryAccessAction id 0x2943 (_ZN21CMilitaryAccessActionC1E11CCountryTagS0_8CEU3Date @0x11e6fd4, 0x40, MILACC / CANCELMILACC); offer: COfferMilitaryAccessAction id 0x2944
+  (_ZN26COfferMilitaryAccessActionC1E11CCountryTagS0_8CEU3Date @0x11fa308, 0x40, OFFERMILACC / REVOKEMILACC). value=false cancels/revokes. No extra args.
+FLEET BASING  ask: CFleetBasingRightsAction id 0x2dd6 (...C1E11CCountryTagS0_8CEU3Date @0x11eff22, 0x40, NAVALACC/CANCELNAVALACC); offer: COfferFleetBasingRightsAction id 0x2dd7 (@0x11f5aea, 0x40, OFFER_NAVALACC/REVOKENAVALACC).
+RIVALS: NOT a diplomatic action, commands (all size 0x58 unless noted; ctor = (CCountryTag country, ...) stored at +0x48,+0x50,+0x58):
+  CAddRivalCommand(country, rival) _ZN16CAddRivalCommandC1E11CCountryTagS0_ @0xf75ea2 (Execute@0xf75f5c -> CCountry::AddRival(rival,bool)@0xf9f220)
+  CRemoveRivalCommand(country, rival) _ZN19CRemoveRivalCommandC1E11CCountryTagS0_ @0xf779ac (CPowerSpending + CCountry::RemoveRival(CCountryTag,bool,bool)@0xfd4c08)
+  CReplaceRivalCommand(country, newRival(+0x50), oldRival(+0x58)) _ZN20CReplaceRivalCommandC1E11CCountryTagS0_S0_ @0xf7694e size 0x60 (Execute@0xf76a20: CPowerSpending then AddRival(+0x50) then RemoveRival(+0x58)) CONFIRMED order.
+  Rivalry is also ended by peace treaty 0x1c (CEndRivalryTreaty). Rival limits/cost not extracted.
+EMBARGO set/lift  CEmbargoAction id 0x293e | ...C1E11CCountryTagS0_8CEU3Date @0x11db66c | 0x40 | EMBARGO / REVOKEEMBARGO (value=false). Execute -> CDiplomacyStatus::SetEmbargoing.
+SEND GIFT  CSendGiftAction id 0x2948 | _ZN15CSendGiftActionC1E11CCountryTagS0_8CEU3Date11CFixedPoint @0x11fe046 | 0x40 | amount CFixedPoint BY POINTER -> int32 at +0x3c; SetMoney(CFixedPoint)@0x11fface (_ZN15CSendGiftAction8SetMoneyE11CFixedPoint); GetMinPrice()/GetPrice().
+  CreateEmptyAction builds it with a stack CFixedPoint. Key SENDGIFT. No revoke.
+SUBSIDIES  CWarSubsidy id 0x2a25 | _ZN11CWarSubsidyC1E11CCountryTagS0_8CEU3Datebi11CFixedPoint @0x120ad66 | 0x48 | (bool, int duration months->+0x40, CFixedPoint amount->+0x3c); defaults bool=1,int=0 in CreateEmptyAction;
+  SetAmount(CFixedPoint)@0x120cdc4, SetDuration(int)@0x120cdca; WAR_SUBSIDIES / WARSUB_CANCEL (value=false). Dialog CWarSubsidyDialog.
+LOAN  COfferLoan id 0x2a24 | _ZN10COfferLoanC1E11CCountryTagS0_i11CFixedPointi8CEU3Date @0x120829a | 0x48 | (int amount->+0x3c, CFixedPoint interest(ptr)->+0x40, int months->+0x44) ; setters SetAmount(int)@0x120ad22, SetIntrest(CFixedPoint)@0x120ad26 (sic), SetDuration(int)@0x120ad2c.
+  CreateEmptyAction passes (0, fp, 12 months). Ask-for-loan is the same object in the other direction? UNSURE (GUI uses CRequestLoanDialog(COfferLoan*)). Execute creates CLoan. Key OFFERLOAN. Taking bank loans/CPayLoanCommand are separate commands, not diplomacy.
+CLAIM THRONE  CClaimThroneAction id 0x2949 | ...C1E11CCountryTagS0_8CEU3Date @0x1200082 | 0x40 | key CLAIM. Needs royal marriage (Execute: HasRoyalMarriage, SetSuccessionClaim). No extras.
+SUPPORT INDEPENDENCE  CSupportIndependenceAction id 0x2f2e | @0x11d0a48 | 0x40 | keys ASK/OFFERSUPPORTINDEPENDENCE and CANCEL_ variants (ask vs offer chosen from relation; value=false cancels).
+VASSALIZE / release  CVassalAction id 0x2940 | _ZN13CVassalActionC1E11CCountryTagS0_8CEU3Date @0x11e158c | 0x40 | keys VASSAL / CANCELVASSAL / BREAKVASSAL. Execute: MakeVassalOrClientVassal. AI @0x11e3696.
+ANNEX VASSAL  CDemandIntegrationAction id 0x2a9c (_ZN24CDemandIntegrationActionC1E11CCountryTagS0_8CEU3Date @0x11dface, 0x40, INTEGRATE / CANCEL_INTEGRATE: value=true start integration, false stop; Execute creates CIntegrateRelation)
+  and CDemandAnnexationAction id 0x293f (@0x11dd6ba, 0x40, ANNEX / CANCEL_ANNEX; CAnnexRelation = diplomatic annexation). Both need a diplomat when value=true. Which of the two the 1.37 button calls "Annex" -> UNSURE.
+  Other subject actions: CDesignateMarchAction 0x301d, CAskForMarchAction 0x3021, CTributaryStateAction 0x35bd (ExecuteAccept/Decline/Cancel), CAskForTributaryStateAction 0x35c4, CConvertTributaryToVassalAction 0x3c89, CConfirmTributeAction 0x35f1 (ctor takes CSubjectTribute const&).
+  Subject interactions via CSubjectInteractionCommand(CSubjectInteraction const*,CCountryTag,CCountryTag)@0x1715298 (size 0x98); CSetSubjectTributeTypeCommand(tag,ETributeType)@0xf849da; CSetSubjectMilitaryFocusCommand@0xf7c648.
+SPY / COVERT (no diplomat; spy network; each ctor (tag,tag,date), value=false twin where listed):
+  CBuildSpyNetwork 0x3378 (@0x1244958,0x40, BUILDSPYNETWORK/CANCEL_BUILDSPYNETWORK) ; CCounterEspionageAction 0x33f9 (@0x12456ea,0x40, + cancel) ;
+  CFabricateClaimAction 0x2af1 (_ZN21CFabricateClaimActionC1E11CCountryTagS0_8CEU3Date @0x123664e, 0x48; SetProvince(CProvince*)@0x1237ab0 -> qword +0x40; SetValue(bool)@0x1237ab6 -> +0x34; CANCEL_FABRICATECLAIM; dialog copies the action, sets province, posts) ;
+  CClaimStateAction 0x36b6 (@0x126240e,0x48; SetProvince(CProvince*)@0x126384e -> +0x40; SetValue(bool)) ; CSupportRebelsAction 0x2dde (@0x1242646,0x48; SetRebelFaction(CRebelFaction const*)@0x1243aaa -> +0x40; SetValue(bool)@0x1243ab0) ;
+  CInfiltrateAction 0x2ddc | CSabotageReputationAction 0x2ddd | CSabotageRecruitmentAction 0x33bf | CSlanderMerchantsAction 0x337b | CCorruptOfficialsAction 0x337c | CSowDiscontent 0x2ddf | CAgitateForLiberty 0x3242 | CJustifyTradeConflictAction 0x2f5e (+cancel: CANCEL_JUSTIFY_TRADE_CONFLICT) |
+  CStealMapAction 0x33c8 (ctor (tag,tag,date,int region); SetRegion(int)@0x123f80e -> +0x3c; SetValue(bool)@0x123f816) ; all 0x40 unless noted. Spy-action reason text includes the spy network cost (GetSpyNetworkCost, A4).
+CURRY FAVORS / support heir: CCurryFavorsAction 0x3acc (@0x1268574,0x40, +cancel), CSupportHeirAction 0x2ff6 (@0x1252a7e,0x40, +cancel). CSupportOwnHeirCommand(CCountryTag)@0xf7b936 is a command.
+ENFORCE PEACE  CEnforcePeaceAction id 0x2dda (_ZN19CEnforcePeaceActionC1E11CCountryTagS0_8CEU3Date @0x12316a6, size 0x48, subclass of CJoinWarAction) | SetEnforcePeaceTarget(CCountryTag)@0x12345c4 -> +0x3c | CInterveneInWarAction id 0x343e (@0x1431428, 0x48; SetEnemyLeader(tag)@0x1432782 -> +0x3c).
+  CJoinWarAction base ctor (tag,tag,tag,date,EType,int,bool)@0x11b2f86. RequireAcceptance true for EnforcePeace (answer = same incoming flow, A5); CRequestPeaceAction::IsSelectable@0x1258890 blocks peace while an EnforcePeace (0x2dda) against that enemy leader is pending.
+CALL INTO WAR / military: CJoinWar family above; CAssumeLeadershipInWarCommand(tag,tag)@0xf8470c (size 0x58); CAlliedObjectiveCommand(tag,tag,int)@0xf71f9c (0x60); CPrepareForWarCommand(tag,tag)@0xf74f32; CToggleBlockOffensiveWarsCommand(tag,tag)@0xf7533c;
+  CWarAnnouncementCommand(tag,tag,tag,CRulerPersonality const*)@0x1382b90 (0x68). Exact roles of args UNSURE (only ctor signatures read).
+KNOWLEDGE SHARING  CKnowledgeSharingAction 0x3776 (offer; OFFER_KNOWLEDGESHARE/KNOWLEDGESHARE) @0x11ea944 0x40 | CAskKnowledgeSharingAction 0x3edc (ask) @0x11eeadc 0x40 (also ctor from CKnowledgeSharingAction const&). No extras; value=false cancels (CKnowledgeSharingAction).
+ABANDON UNION  CAbandonUnionAction 0x34af | _ZN19CAbandonUnionActionC1E11CCountryTagS0_8CEU3Date @0x11e3858 | 0x40 | key ABANDONUNION (value true only).
+THREATEN WAR  CThreatenWarAction 0x3307 | _ZN18CThreatenWarActionC1E11CCountryTagS0_8CEU3DateiS0_ @0x120d5d8 | 0x48 | (int province -> +0x3c, CCountryTag taker -> +0x40); GUI CThreatenWarDialog sets SetProvince(int)@0x12106da, SetTaker(tag)@0x12106e2.
+  CreateEmptyAction passes province=-1, taker "---". Execute builds a CDeclareWarAction + CCedeProvinceTreaty (AE impact). RequireAcceptance true.
+TRANSFER TRADE POWER 0x2e09 CTransferTradePowerAction (@0x1239cc0, 0x48, + cancel; GUI CTransferTradePowerDialog picks the node; node field not extracted -> UNSURE) | STEER TRADE 0x3778 CSteerTradeAction (@0x123bd2c, 0x40, + cancel).
+TRADE FAVORS ("return favors"): CReturnCoreFavorAction 0x3bcc (ctor +int; SetProvince(int)@0x1218ac4 -> +0x3c, SetReturnTag(tag)@0x1218acc -> +0x40, size 0x48), CReduceRelationsFavorAction 0x3bcd (CCountryAction, 3 tags + date; size 0x48; C1@0x1218b8e),
+  CBreakAllianceFavorAction 0x3bcb, CTradeFavorsForGold 0x3bce / Manpower 0x3bcf / Sailors 0x3bd0 / Heir 0x3bd2 / Trust 0x3bd3 (0x48) / PrepareForWar 0x3bd4 (all (tag,tag,date), 0x40 unless noted; CTradeFavorsForTrustAction::IsAutoAccept true).
+RELIGION / CRUSADE: CCallCrusadeAction 0x2cd5 (@0x122dc1c,0x40) | CExcommunicateAction 0x2cd6 (@0x122ecc8,0x40, REVOKE_EXCOMMUNICATE twin) | CAppointCardinalAction 0x39c1 (@0x1267e5e, 0x40) | CCharterCompanyAction 0x3866 (0x48) | CReligiousUnityAction 0x2d48 (@0x121fe6a).
+HRE actions (class list only): CInviteToHRE 0x3b85, CGrantElectorateAction 0x2b1c, CRemoveElectorateAction 0x3177, CGrantFreeCityAction 0x31f6, CRemoveFreeCityAction 0x31f7, CImperialRealmWarAction 0x3a6b, CImperialRelationsAction 0x2d46, CDemandUnlawfulTerritoryAction 0x2e0b.
+GREAT POWER / influence (class list only): CInfluenceNationAction 0x346e (0x40), CTakeOnDebtAction 0x3469, CBreakAllianceGreatPowerAction 0x3375, CInterveneInWarAction 0x343e, CEnforcePeaceAction 0x2dda; GP-ness gated by CCountry::IsGreatPower(bool)@0xfd590c inside IsDiplomaticActionValid.
+OTHER LEAGUE/FEDERATION/COALITION: CFormCoalition 0x2de0 (JOIN/LEAVE_COALITION), CInviteToFederation 0x2f0f (+CString const& name arg, size 0x60, KICKFROMFEDERATION twin), CRequestToJoinFederation 0x2f0e (LEAVEFEDERATION), CInviteToTradeLeague 0x331d (ctor +bool; size 0x40),
+  CRequestToJoinTradeLeague 0x3320. ECONOMY: CSellProvince 0x2a29 (ctor +int,int; size 0x48; SetPrice(int)@0x1216738 -> +0x3c, SetProvince(int)@0x121673c -> +0x40), CSellShipsAction 0x3028 (+int price, CUnit*; size 0x50; SetUnit(CUnit*)@0x121eb4a -> qword +0x40, SetPrice -> +0x3c),
+  CShareMapAction 0x3323 (+int region; SetRegion(int)@0x121237c -> +0x3c), COfferCondottieriAction 0x33b9 (size 0x60, skipped).
+SCRIPTED actions (common/new_diplomatic_actions): CScriptableDiplomaticAction id 0x3662 | _ZN27CScriptableDiplomaticActionC1EPK37CScriptableDiplomaticActionDefinition11CCountryTagS3_8CEU3Date @0x16edecc | 0x48; the 0x3662 slot repeats once per
+  definition in CDiplomaticActionDatabase::GetInstance() (vector at db+0 .. db+8 of CScriptableDiplomaticActionDefinition const*); pass the definition to CreateDiplomaticAction as 5th arg. Token = vptr+0xa0 returns [def+0x40] for scripted ones (UNSURE).
+UNCONDITIONAL SURRENDER  CUnconditionalSurrender id 0x33c4 | _ZN23CUnconditionalSurrenderC1E11CCountryTagS0_8CEU3Date @0x125ef62 | 0x40 | Execute sets CDiplomacyStatus::SetUnconditionalSurrenderDate + TransferControlToEmemy (sic); needs diplomat. See C.
+SET ATTITUDE (AI attitude toward player): CTogglePlayerBehaviourFlagCommand(CCountryTag country, CCountryTag other, int flag) _ZN33CTogglePlayerBehaviourFlagCommandC1E11CCountryTagS0_i @0xf746e6 size 0x60 (Execute@0xf747b4 uses CDiplomacyStatus::UsesPlayerAttitude; GUI CheckboxPlayerBehaviour{Ally,Enemy,Threat,Neutral,Manual}@0x1a879d6..; flag values not extracted -> UNSURE).
+  CSetPlayerAiPrefsCommand(CCountryTag, CPlayerAiPrefs const&)@0xf7a1b6 (size 0x78) is the per-country AI automation prefs command.
+NOT FOUND as actions: "revoke warning", "ask for loan" distinct class, "break royal marriage" distinct class (it is RoyalMarriage value=false), "dissolve alliance" distinct class (Alliance value=false), "build/lift embargo" distinct (Embargo value).
+
+C. PEACE
+========
+C1. CPeaceOffer (CPersistent subclass; vtable 0x26825c0)  size 0x1a0 (UNSURE-ish: = distance between its in-place copy at CRequestPeaceAction+0x40 and the next field at +0x1e0)
+ ctor: CPeaceOffer(CCountryTag A, CCountryTag B, bool isOffer) _ZN11CPeaceOfferC1E11CCountryTagS0_b @0x15ae0e4 : A -> +0x14, B -> +0xc, bool -> +0x1c; then SetGiversAndTakers()@0x15ae29c,
+   InitializeCachedWarscoreData, CreateAllValidTreaties()@0x15ae822 (every legal treaty object is pre-built and stored; nothing is "added", you SELECT).
+   GUI construction (CPeaceView::SetOfferAndDemand@0x1e4762a): OFFER (player gives): CPeaceOffer(player, target, 1); DEMAND (player takes): CPeaceOffer(target, player, 0). CONFIRMED (@0x1e476b5, @0x1e476f2).
+   copy ctor _ZN11CPeaceOfferC1ERKS_ @0x15b067e; dtor @0x15b0d46. Fields seen: +0xc,+0x14 tags(+idx at +0x10/+0x18), +0x1c bool, +0x20 vector<CCountryTag> war givers, +0x38 vector war takers (GetWarGivers/GetWarTakers@0x15b9204/0x15b920a return &member),
+   +0x80 CArray<CPeaceTreaty*> valid treaties (GetValidTreaties()@0x15b907a returns &member; UNSURE if flat or per-category: +0xc8 is vector<CArray<CPeaceTreaty*>> of 40 categories), +0xe8 cached score.
+ Selecting demands (CONFIRMED, CPeaceView::CPeaceEntry::Select@0x1e53396): t = element of GetValidTreaties(); if CPeaceTreaty::IsSelected()@0x15da9fa -> CPeaceOffer::DeselectTreaty(CPeaceTreaty*,bool,bool)@0x15b83a0 (false,false);
+   else { CArray<SPeaceTreatyTag> why{0,0,0}; if CPeaceOffer::CanSelectTreaty(CPeaceTreaty const*,CArray<SPeaceTreatyTag>&,bool,CToolTip*)@0x15b7cd8 (why,false,nullptr) SelectTreaty(CPeaceTreaty*,bool,bool)@0x15b8250 (false,false) }.
+   Other helpers: SelectBestTreaties(int,CArray<SPeaceTreatyTag>&,bool)@0x15d0f18 (used by "Suggest" CPeaceView::SuggestOffer@0x1e4a62c), ClearSelected@0x15b8902, ClearTreaties(bool), TrySelectAnnex, SetGold(CFixedPoint(ptr))@0x15b8a18 (money demand/offer),
+   HasSelectedTreatiesOfType(SPeaceTreatyTag), GetSelectedTreatiesOfType(CPdxArray<CPeaceTreaty*,int>&,SPeaceTreatyTag,bool), GetCededProvinces(CArray<CProvince*>&), WillCedeProvince(CProvince*,CCountryTag&), CanDemandCapital(CProvince const&,CWar*).
+ CPeaceTreaty vtable (vptr+): 0x58 GetActualTaker 0x60 GetClickTargetProvinceID 0x68 IsProvinceTreaty 0x70 GetProvince 0x98 IsValid 0xa0 IsSelectable 0x80 GetType (rax=EStaticTreatyType, rdx=scripted def ptr: SPeaceTreatyTag) 0xa8 GetStaticToken 0xb0 Execute(CPeaceOffer const&,CWar*)
+   0x128 GetWarScoreCost(CPeaceOffer const&,bool) (slot 37, raw 0x138-0x10). IsSelected@0x15da9fa, SetSelected(bool). Treaty ctors (examples): CCedeProvinceTreaty(tagA,tagB,tagC,CProvince*,bool) @C1E..PK9CProvinceb,
+   CGoldTreaty(tag,tag), CReturnCoreTreaty(4 tags,CProvince*), CRevokeCoreTreaty(3 tags,CProvince*), CHumiliateTreaty(3 tags), CReleaseNationTreaty(4 tags), CBecomeVassalTreaty(4 tags), CAnnulTreatiesTreaty(4 tags), CWarReparationsTreaty ...; created by CPeaceTreatyFactory::Create(SPeaceTreatyTag).
+ EStaticTreatyType (GetType() return, CONFIRMED per class): 0 Gold(money) | 1 BecomeVassal | 2 SubjugateVassal | 3 CedeProvince | 4 RevokeCore | 5 ReturnCore | 6 GiveUpClaims | 7 WarReparations | 8 TransferTradePower | 9 HumiliateRival |
+   0xa Humiliate | 0xb ConcedeDefeat | 0xc RevokeReform | 0xd ChangeHREReligion | 0xe AnnulTreaties | 0xf ReleaseNation | 0x10 EnforceMilitaryAccess | 0x11 EnforceFleetBasing | 0x12 GrantIndependence | 0x13 ReleaseVassal |
+   0x14 TransferVassal | 0x15 ChangeReligion | 0x16 ChangeGovernment | 0x17 DismantleRevolution | 0x18 RevokeElector | 0x19 EnforceRebelDemands | 0x1a FormPersonalUnion | 0x1b ConcedeColonialRegion | 0x1c EndRivalry |
+   0x1d TakeMandate | 0x1e BecomeTributary | 0x1f SubjugateTributary | 0x20 SteerTrade | 0x21 JoinEmpire | 0x22 SpreadRevolution | 0x23 ForceMigration | 0x24 ForceOutColonizers | 0x25 PillageCapitalState |
+   0x26 GuaranteedJoinEmpire | 0x27 Scripted (CScriptablePeaceTreaty; rdx = definition from common/peace_treaties). The mapping to script names (po_*) is by class meaning only (UNSURE; CWarGoalPeace::AllowsPeaceOption(SPeaceTreatyTag const&,CCasusBelliType const*) gates them by CB).
+ Peace cost/acceptance numbers (all int returns in eax):
+   war score the offer costs: CPeaceOffer::GetWarScoreCost(bool) const @0x15b33fe (_ZNK11CPeaceOffer15GetWarScoreCostEb; ends with CFixedPoint::GetRounded()); per treaty: CPeaceTreaty::GetWarScoreCost(CPeaceOffer const&,bool) (vptr+0x128).
+   current war score: CWar::GetWarScore(CCountryTag me, CCountryTag other, CString* breakdown(optional), bool) const @0x193be5a (_ZNK4CWar11GetWarScoreE11CCountryTagS0_P7CStringb; SuggestOffer@0x1e4a743 calls with (player, target, nullptr, 0)); clamped by NDefines::NDiplomacy::MAX_WARSCORE.
+   AI acceptance of an offer: CCountry::CalcAIPeaceAcceptance(CArray<CDiploChance>* list, bool recordList, CCountryTag offerer, CPeaceOffer const& offer, CCountryTag other('---' null), bool, bool, bool, bool* out) const @0xe9b6dc
+     (_ZNK8CCountry21CalcAIPeaceAcceptanceEP6CArrayI12CDiploChanceEb11CCountryTagRK11CPeaceOfferS4_bbbPb); this = the ANSWERING AI country. CRequestPeaceAction::GetAIAcceptanceDerived@0x1258de4 passes (list, listflag, [action+0xc], offer=&action+0x40, 0x2d2d2d, 1,0,0,nullptr);
+     SuggestOffer passes (list,0,player,offer,0x2d2d2d,0,0,1,nullptr). Result int > 0 = accept (UNSURE of scale). Simpler: action->vptr+0xc0 WillAIAccept(list) (works for peace too).
+   Other: CPeaceOffer::IsWhitePeace(bool)@0x15b354a, IsConcedeDefeat()@0x15bc320, IsIndependence(), GetWarGoalPeace(), IsGiverWarLeader()@0x15b30f6, IsTakerWarLeader(), GetPrestigeImpact(CCountryTag,bool), CCountry::CalcDesireForPeace(...)@0x1049266/0x10492ec, WillSuggestPeaceTo(CCountryTag), WillAcceptSurrenderFrom(CCountryTag,CWar const*).
+C2. CRequestPeaceAction  id 0x293c | _ZN19CRequestPeaceActionC1E11CCountryTagS0_bRK11CPeaceOffer8CEU3Date @0x1255d50 | size 0x1e8
+   (actor, target, bool isOffer -> +0x3d, CPeaceOffer const& copied by value into +0x40, date). Ctor stores +0x3c=1 (uses diplomat), +0x1e0 byte forceAccept=0 (CRequestPeaceAction::SetForceAccept(bool)@0x1258e84).
+   GUI send = CPeaceView::SendOffer@0x1e4ab78 (CONFIRMED): a=new(0x1e8); ctor(a, GetPlayer(), view[+0x2c] target tag, bool=byte view[+0x828], offer= view[+0x828] ? view+0x48 (offer) : view+0x1e8 (demand), date=gs+0x1da0);
+     if a->WillAIAccept(nullptr) -> SetForceAccept(true); if a->IsGUISelectable(nullptr,false)@0x12589f2 { a->CreateCommand(&up); CSession::Post; } then `vptr=CRequestPeaceAction; ~CPeaceOffer(a+0x40); operator delete(a)` (inline free; vptr+8 is equivalent).
+   IsGUISelectable also enforces a cooldown (date <= country+0x24a8 / gs+0x1d6c -> red text; UNSURE exact) ; IsSelectable@0x1258890 = base + "peace enforced" check (EnforcePeace 0x2dda in actor's incoming list whose +0x40 equals enemy war leader).
+   Execute (ExecuteDerived@0x1256168) does CPeaceOffer::Execute(), removes participants, end-of-war popup. Script white-peace effect CWhitePeaceEffect::Execute@0x130b5fa..0x130b63d: CPeaceOffer(a,b,1) with nothing selected + CRequestPeaceAction(a,b,1,offer,now), +0x30=2, direct Execute().
+   Player->AI recipients are answered instantly by the command; a human recipient gets it in the country+0x18c0 list (A5) and answers with the same accept/decline sequence. CRequestPeaceAction::RequireAcceptance (vptr+0xd8) = (EType==0) with extras.
+C3. White peace / surrender / separate peace
+   White peace = an offer with NO treaty selected (CPeaceOffer::IsWhitePeace); the AI accepts if CalcAIPeaceAcceptance>0 (needs war score balance). Offer with CConcedeDefeatTreaty (type 0xb) selected = player concedes defeat (IsConcedeDefeat).
+   Unconditional surrender = separate action CUnconditionalSurrender id 0x33c4 (B). Requires the war and (UNSURE) specific conditions; Execute transfers control to the enemy.
+   Separate peace vs war leader: CPeaceOffer::SetGiversAndTakers/SetWarGiversAndTakers@0x15b9210 fill the war giver/taker vectors from CWar attackers/defenders (leader = first element of each vector, CWar::IsWarLeader@0x19412bc); IsGiverWarLeader/IsTakerWarLeader tell
+   whether the offer ends the whole war or just one participant (CPeaceOffer::AddSeparatePeaceOpinions, Execute_SeparatePeaceOpinions). The player chooses the counterpart by target tag (view+0x2c = CAffectedShieldItem click); the enemy war leader is CWar::GetEnemyWarLeader(CCountryTag)@0x194412e. Exact rules UNSURE.
+C4. Wars / participants (CONFIRMED conventions)
+   CCountry::GetCurrentWars(CArray<CWar*>& out) const @0x103b106 (_ZNK8CCountry14GetCurrentWarsER6CArrayIP4CWarE): this=country, rsi=&vector<CWar*>{0,0,0} (zero-init), appends unique CWar* (reads country+0x1b70 opponent list -> country+0x1530 CRelationsContainerArray<CWar>::GetEntry(tag)).
+     Also a CPdxArray<CWar*,int>& overload @0x103b1a0. Free: operator delete(begin). Single war vs a tag: CDiplomacyStatus::GetWar() (status = country+0x1500 array stride 0x48 indexed by the other tag's int16 index; _ZN16CDiplomacyStatus6GetWarEv @0x169ac82), CCountry::IsAtWarWithCountry(CCountryTag)@0x100192c.
+   CWar: GetName() const @0x193819e returns pointer to CString at war+0x20 (no sret; `lea rax,[rdi+0x20]`), GetAttackers()@0x193739a / GetDefenders()@0x19373a0 return pointers to std::vector<CCountryTag> at +0x40 / +0x70 (8-byte tags, element 0 = leader),
+     GetPersistentAttackers()@0x1938a22 (+0x210), IsAttacker/IsDefender(tag)@0x1938a5c/0x1938a32 (bool), IsWarLeader(tag)@0x19412bc, GetEnemyWarLeader(tag)@0x194412e / GetOurWarLeader(tag)@0x19441a8 (return CCountryTag in rax),
+     GetWarGoal()@0x1938eb8 (CWarGoal*), GetStartDate()@0x1941aca / GetEndDate()@0x1941b76 (sret? they build a date in registers -> UNSURE; use gs-style int32), GetWarScore(me,other,CString*,bool)@0x193be5a (int), GetBattleScore()@0x1942b54, GetOpposition(tag)@0x1944200,
+     GetOccupiedScore(...), GetParticipationScore(tag)@0x1944d7c, GetWarScoreDesc(tag,tag)@0x19435d2, HasTickingWarScore, GetTickingWarscore(tag). Player-side: CCountryDiplomacyView::UpdateEnemies(CArray<CCountryTag> const&)@0x1a8b670, CWarOverview*, CInGameIdler::WarOverviewRightButton.
+D. UNSURE / not extracted
+   SBelligerent layout; WAR_GOAL_TYPES enum values; ECallAllyType and the E*** enum meanings; flag meaning of CDiploChance+0x28; gs+0x2349 and gs+0x742c; peace cooldown fields (country+0x24a8, gs+0x1d6c/0x1d74); which tag order BreakAlliance uses; CPeaceTreaty<->po_* script-name table;
+   whether CreateValidWarGoals dereferences an empty std::function (the game's own effect passes an empty one, so it is safe to do the same); TransferTradePower node field; CPeaceOffer exact sizeof (0x1a0 inferred).

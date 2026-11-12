@@ -1,0 +1,57 @@
+ALERTS (eu4mcp/alerts.py): one rule table, thresholds as named constants at the top of the module.
+
+Where they show
+- eu4_advance: appends "ALERTS:" (STOP lines first, at most 8 lines) when something is true. Its FIRST line is
+  "STOPPED: alert <rules>: deal with it before advancing" when a STOP rule has a subject (province, war, army, estate ...)
+  that was not true in the previous snapshot, or when the live per-step check fired ("live stability -2" / "live treasury -55").
+- eu4_status (player only): the same block.
+- eu4_alerts (no args): every true alert, up to 30 lines, no monthly throttle.
+- INFO lines appear in eu4_advance / eu4_status at most once per game month per rule (state: <EU4_MCP_STATE>/alerts_shown.json).
+  STOP lines appear every time they are true.
+
+When eu4_advance can stop
+- The run is 10-day hook `wait` steps. After every step that reached its date it reads CCountry live (Live.country: one vm read)
+  and ends the run early when stability fell to <= STABILITY_MIN or treasury fell below TREASURY_MIN (it was not so at the start).
+- All save-based rules run once, at the end of the call, on the snapshot the call writes (no save is written mid-run: a save is
+  ~40 MB and takes seconds). So a province lost or a war declared in the middle of a 30-day call is reported at the end of that
+  call (with STOPPED on line 1); the run itself is not cut short by it. The hook's wait cannot be interrupted from Python.
+
+Rule table (level, source, threshold, what to do)
+STOP game_stuck      live: date unchanged after a wait (no event)             check for an open window or a crash
+STOP save_stale      live: fresh save date vs game date >= SAVE_LAG_DAYS (3)    eu4_refresh, check the hook
+STOP window_open     live: Live.open_windows (idler updateable list, dialogs)   close it in the game; events: eu4_events
+STOP occupied        provinces.-<id>.owner == us, controller != us              siege it back or make peace
+STOP rebels          countries.REB.army.location in our provinces               attack with a bigger army, raise stability
+STOP war_on_us       active_war.defenders has us, war name not in prev snapshot eu4_wars; call allies, gather the army
+STOP money           countries.<T>.treasury < -50 (TREASURY_MIN); loan count >= 3 (LOANS_MAX)   cut costs, no new loans
+STOP ruler           monarch id changed vs prev; monarch age < 15 (regency); monarchy without heir and ruler age >= 50
+STOP stability       countries.<T>.stability <= -2                             eu4_economy stability
+STOP legitimacy      countries.<T>.legitimacy < 70                             events, advisors
+STOP disaster        countries.<T>.disaster_progress[i] >= 50 (name = i-th key of common/disasters/*.txt in file order; inferred)
+STOP estates         estate loyalty < 25 (save or live); influence >= 100 (live only: Estates._estates)
+STOP coalition       countries.<T>.coalition_against_us non-empty               stop expanding, improve relations
+INFO war_exhaustion  countries.<T>.war_exhaustion >= 6
+INFO manpower        manpower < 10 % of max_manpower
+INFO power           countries.<T>.powers [adm,dip,mil] any >= 400
+INFO idea_slot       slots from technology.adm_tech (5,7,10,14,18,22,26,29 = common/technologies/adm.txt allowed_idea_groups)
+                     minus active_idea_groups keys found in common/ideas/00_basic_ideas.txt
+INFO advisor         live: Live.advisor_slots (CCountry+0x14d0 CAdvisor*[3]; null or id 0 = empty)
+INFO idle_envoys     countries.<T>.{diplomats,merchants,colonists}.envoy without `action`
+INFO inflation       countries.<T>.inflation >= 3
+INFO overextension   countries.<T>.overextension_percentage >= 0.5 (fraction)
+INFO uncored         owned_provinces not in core_provinces
+INFO liberty         diplomacy.dependency first=us -> subject's cached_liberty_desire >= 50
+INFO refused         journal: same act (tool + args) failed >= 3 times in the last 200 entries
+
+Left out (not readable reliably from the plain-text save, or needs history the tools do not keep)
+- truces about to expire: the save has active_relations.<X>.truce=yes and last_war/last_warscore but no end date.
+- empty advisor slot from the save: top-level active_advisors.<TAG> lists the advisor POOL (11 ids for CAS), not the hired three,
+  so it is read live instead (and is absent without a hook).
+- estate influence from the save: only influence_modifier entries are stored; the total is computed (read live).
+- stability <= 0 for a year, manpower near zero for months, net income negative 3 reports in a row: need a history of snapshots
+  (only the last one is kept as "previous").
+- enemy army landing in our land, army strength < 25 % at war, idle armies / stalled sieges / no general / low morale: possible
+  from the save (army.location, regiment.strength, siege blocks) but not built yet; rebel unrest >= 10 per province neither.
+- tech lag, colonisable provinces, decisions/missions available, spy network >= 20 with no claim, estate agendas/actions off
+  cooldown: need game-side checks (the live tools have them: eu4_economy colonisable, eu4_estates list, eu4_diplo list).
+- notes not updated for 5+ years: the notes files have no game date per section.

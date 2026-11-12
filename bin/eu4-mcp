@@ -1,0 +1,11 @@
+#!/bin/sh
+# Launcher for the EU4 MCP server (stdio). Nothing but MCP frames may reach stdout.
+# Python: $EU4_MCP_PYTHON, else <repo>/.venv/bin/python, else python3 on PATH.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+cd "$HERE" || exit 1
+if [ -n "$EU4_MCP_PYTHON" ]; then PY="$EU4_MCP_PYTHON"
+elif [ -x "$HERE/.venv/bin/python" ]; then PY="$HERE/.venv/bin/python"
+else PY=python3; fi
+exec "$PY" -m eu4mcp "$@"

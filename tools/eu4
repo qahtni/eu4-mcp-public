@@ -1,0 +1,182 @@
+#!/bin/bash
+# One command for the whole EU4 setup. A leading dash is fine: `eu4 -start` = `eu4 start`.
+#   eu4 start            start everything except Claude: display, game (last save, paused), video stream,
+#                        game screen (EU4_VNC_PORT), watch page (EU4_WATCH_PORT), narrator, camera, pop-up watch (revanchism service only if EU4_MCP_REVANCHISM=1)
+#   eu4 play             start (if needed) and let Claude play, in tmux session EU4_PLAYER_SESSION (default eu4-player) (this is what costs usage)
+#   eu4 status           what is running, game date, player session, buff, links
+#   eu4 pause            pause the game and tell the player to wait
+#   eu4 resume           tell the player to continue
+#   eu4 say TEXT         send a message to the player session
+#   eu4 attach           open the player session (tmux; leave with Ctrl-b d)
+#   eu4 save             save the game now and archive the play log
+#   eu4 stop             player writes notes and pauses, game is saved, play log archived, everything shut down
+#   eu4 discord          Discord (Vesktop, optional) on EU4_DISCORD_PORT with the game mirror for screen share
+#   eu4 discord page     share window = the watch page (720p) instead of the game; eu4 discord game = back to the game
+#   eu4 discord show     bring the Discord window back after it was closed
+#   eu4 discord stop     end Discord and the sharing windows
+#   eu4 buff [REASON]    optional cheat, needs EU4_MCP_REVANCHISM=1: grant the revanchism buff now (100% for 5 game years)
+#   eu4 log [N]          last N narrator lines (default 10)
+#   eu4 deploy           put changed MCP tool code into the running sessions without a restart
+#   (start, play, stop and discord work in the background: the terminal returns at once and may be closed)
+#   eu4 help             this list (also shown by plain `eu4`)
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+. "$REPO/tools/config.sh"
+T="$REPO/tools"; PY="$REPO/.venv/bin/python"; HOST="$EU4_HOST"; SESS="$EU4_PLAYER_SESSION"
+cmd="${1:-help}"; cmd="${cmd#-}"; cmd="${cmd#-}"; shift 2>/dev/null
+cd "$REPO" || exit 1
+
+hook() { "$PY" - "$@" <<'PYE' 2>/dev/null
+import sys
+from eu4mcp.hookclient import HookClient
+h = HookClient(timeout=5)
+op = sys.argv[1]
+if op == "info":
+    i = h.info()
+    print(f"{i.get('date','?')} {'paused' if i.get('paused') else 'running'} speed {i.get('speed','?')} {i.get('player','')}" if i.get("ingame") else "menu")
+elif op == "pause":
+    h.pause(True); print("paused")
+elif op == "save":
+    print(h.save())
+PYE
+}
+player_up() { tmux has-session -t "=$SESS" 2>/dev/null; }
+tsend() { tmux send-keys -t "=$SESS" -l "$1" && sleep 0.3 && tmux send-keys -t "=$SESS" Enter; }
+ttail() { tmux capture-pane -p -t "=$SESS" -S -"${1:-12}" 2>/dev/null; }
+wait_ingame() {
+  for _ in $(seq 1 40); do
+    s="$(hook info)"; case "$s" in ""|menu) ;; *) echo "game: $s"; return 0 ;; esac
+    read -t 3 <> <(:)
+  done
+  echo "game did not reach the campaign within 2 minutes (eu4 status; tools/game.sh log)"; return 1
+}
+links() { echo "watch page  http://$HOST:$EU4_WATCH_PORT/"; echo "game screen http://$HOST:$EU4_VNC_PORT/vnc.html  (you can click)"; }
+
+# start, play, stop and discord take a minute or more: they run as a background job (systemd unit eu4-job), so the
+# terminal comes back at once and may be closed. EU4_FG=1 runs them in the foreground instead.
+case "$cmd" in start|play|stop|discord)
+  if [ -z "${EU4_FG:-}" ]; then
+    if systemctl --user is-active -q eu4-job; then
+      echo "an earlier eu4 start/play/stop is still working; this one runs right after it"
+      for _ in $(seq 1 100); do systemctl --user is-active -q eu4-job || break; read -t 3 <> <(:); done
+    fi
+    systemctl --user reset-failed eu4-job 2>/dev/null
+    systemd-run --user --collect --quiet --unit=eu4-job -p KillMode=process --setenv=EU4_FG=1 --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+      "$(readlink -f "$0")" "$cmd" "$@" || exit 1
+    case "$cmd" in
+      start) echo "starting in the background (about a minute). You can close this window. Check with: eu4 status" ;;
+      play)  echo "starting the game (if needed) and Claude in the background (1-2 minutes). You can close this window. Check with: eu4 status" ;;
+      stop)  echo "stopping in the background (the player writes its notes first, up to 4 minutes). You can close this window. Check with: eu4 status" ;;
+      discord) if [ "${1:-}" = stop ]; then echo "stopping Discord in the background. Check with: eu4 status"
+               else echo "working in the background (about 20 s). Then open http://$HOST:$EU4_DISCORD_PORT/ . Check with: eu4 status"; fi ;;
+    esac
+    exit 0
+  fi ;;
+esac
+
+case "$cmd" in
+start)
+  "$T/game.sh" start -continuelastsave | tail -1
+  read -t 3 <> <(:)
+  if ! systemctl --user is-active -q eu4-game; then
+    echo "retrying the game start once"; "$T/game.sh" start -continuelastsave | tail -1; read -t 3 <> <(:)
+    systemctl --user is-active -q eu4-game || { echo "THE GAME DID NOT START (tools/game.sh log; tools/display.sh status)"; exit 1; }
+  fi
+  wait_ingame || exit 1
+  "$T/stream.sh" start >/dev/null 2>&1
+  systemctl --user is-active -q eu4-vnc || "$T/viewer.sh" start control >/dev/null 2>&1
+  "$T/watch.sh" start >/dev/null 2>&1
+  "$PY" -c "from eu4mcp import revanchism as R; R.ensure_service()"
+  systemctl --user start eu4-playlog-save.timer 2>/dev/null
+  "$0" status
+  echo "Claude is not playing yet: eu4 play"
+  ;;
+play)
+  systemctl --user is-active -q eu4-game && systemctl --user is-active -q eu4-watch || "$0" start
+  if player_up; then echo "the player session is already running (eu4 attach)"; exit 0; fi
+  [ -n "$EU4_PLAYER_CMD" ] || [ -r "${EU4_PLAYER_PROMPT:-$T/player_prompt.txt}" ] || { echo "no player prompt: copy tools/player_prompt.example.txt, fill it in and set EU4_PLAYER_PROMPT=<file> (or EU4_PLAYER_CMD)"; exit 1; }
+  if [ -n "$EU4_PLAYER_CMD" ]; then tmux new-session -d -s "$SESS" -c "$REPO" "$EU4_PLAYER_CMD"
+  else tmux new-session -d -s "$SESS" -c "$REPO" claude --agent eu4-strategist "$(cat "${EU4_PLAYER_PROMPT:-$T/player_prompt.txt}")"; fi
+  echo "player started in tmux session $SESS"
+  echo "watch it: http://$HOST:$EU4_WATCH_PORT/   or: eu4 attach"
+  ;;
+status)
+  for u in eu4-game eu4-stream eu4-vnc eu4-novnc eu4-watch eu4-narrator eu4-camera eu4-blockwatch eu4-revanchism eu4-discord eu4-discord-mirror eu4-discord-page eu4-playlog-save.timer; do
+    printf '%-24s %s\n' "$u" "$(systemctl --user is-active "$u" 2>/dev/null)"
+  done
+  systemctl --user is-active -q eu4-job && echo "job:    a start/play/stop is still working (journalctl --user -u eu4-job -n 5)"
+  journalctl --user -u eu4-job -n 40 --no-pager 2>/dev/null | grep -q 'DID NOT START\|did not reach the campaign' && \
+    echo "job:    the last start had a problem: $(journalctl --user -u eu4-job -n 40 --no-pager | grep -o 'THE GAME DID NOT START.*\|game did not reach.*' | tail -1)"
+  s="$(hook info)"; echo "game:   ${s:-not running}"
+  if player_up; then echo "player: running in tmux $SESS | $(ttail 8 | grep -v '^[─❯ ]*$\|shift+tab' | tail -1 | cut -c1-90)"; else echo "player: not running (eu4 play)"; fi
+  "$PY" -c "
+import sys
+from eu4mcp import revanchism as R
+d = sys.argv[1].split()[0] if sys.argv[1][:1].isdigit() else None
+st = R.load(); u = R.active(date=d) if d else None
+print('buff:   ' + (R.label(u) if u else 'none active (last one until ' + str(st.get('until')) + ')'))" "$s" 2>/dev/null
+  links
+  ;;
+pause)
+  player_up && tsend "Message from the operator: PAUSE. Stop your helper agents, pause the game, write a short note of where you are, and wait. Do not play until the user says continue." >/dev/null
+  hook pause || echo "game not running"
+  ;;
+resume|continue)
+  player_up || { echo "no player session: eu4 play"; exit 1; }
+  tsend "Message from the operator: continue playing from your notes." >/dev/null && echo "player told to continue"
+  ;;
+say)
+  player_up || { echo "no player session"; exit 1; }
+  tsend "Message from the operator: $*"
+  ;;
+attach) exec tmux attach -t "$SESS" ;;
+save)
+  hook save || echo "game not running"
+  "$PY" "$T/save_playlog.py" 2>&1 | tail -2
+  ;;
+stop)
+  if player_up; then
+    echo "asking the player to write its notes and pause (up to 4 minutes)..."
+    tsend "Message from the operator: we are stopping. Stop your helper agents, pause the game, bring the notes up to date (state, plan, wars, loans, anything the next session needs), then reply exactly READY FOR SHUTDOWN and do nothing else." >/dev/null
+    for _ in $(seq 1 48); do
+      ttail 12 | grep -q '● READY FOR SHUTDOWN' && { echo "player is ready"; break; }
+      read -t 5 <> <(:)
+    done
+    tmux kill-session -t "=$SESS" 2>/dev/null
+  fi
+  if systemctl --user is-active -q eu4-game; then
+    hook pause >/dev/null; echo "saved: $(hook save || echo 'SAVE FAILED (the last autosave stays)')"
+  fi
+  "$PY" "$T/save_playlog.py" 2>&1 | tail -1
+  "$T/discord.sh" stop >/dev/null 2>&1
+  "$T/watch.sh" stop 2>/dev/null; "$T/stream.sh" stop 2>/dev/null; "$T/viewer.sh" stop 2>/dev/null
+  systemctl --user stop eu4-revanchism 2>/dev/null
+  "$T/game.sh" stop
+  "$T/display.sh" stop >/dev/null 2>&1
+  echo "everything is stopped. Start again: eu4 start   (then: eu4 play)"
+  ;;
+discord)
+  if [ "${1:-}" = stop ]; then "$T/discord.sh" share off >/dev/null 2>&1; "$T/discord.sh" stop; echo "Discord stopped"; exit 0; fi
+  if [ "${1:-}" = show ]; then "$T/discord.sh" show; exit 0; fi
+  "$T/discord.sh" start >/dev/null 2>&1
+  if [ "${1:-}" = page ]; then "$T/discord.sh" share page; else "$T/discord.sh" share on >/dev/null 2>&1; fi
+  "$T/discord.sh" status 2>/dev/null | head -8
+  if [ "${1:-}" = page ]; then echo "Discord: http://$HOST:$EU4_DISCORD_PORT/  -> start a screen share there and pick the window \"Claude plays EU4\""
+  else echo "Discord: http://$HOST:$EU4_DISCORD_PORT/  -> start a screen share there and pick the window \"eu4-mirror\" or Entire screen"; fi
+  ;;
+log)
+  "$PY" - "${1:-10}" <<'PYE'
+import json, sys
+from eu4mcp import journal
+rows = [json.loads(l) for l in open(journal.path(), encoding="utf-8") if '"kind":"story"' in l]
+rows = [r for r in rows if (r.get('text') or '').strip()]
+for r in rows[-int(sys.argv[1]):]:
+    print(f"{r.get('date','')}  {r.get('text','')}")
+PYE
+  ;;
+buff)
+  "$PY" -m eu4mcp.revanchism grant "$@"
+  systemctl --user is-active -q eu4-game || echo "the game is not running: the buff starts when it is next in a campaign (eu4 start)"
+  ;;
+deploy) exec "$T/deploy.sh" "$@" ;;
+*) sed -n '2,/^REPO=/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//' ;;
+esac

@@ -1,0 +1,38 @@
+Estates (eu4mcp/estates.py): live prove plan. Throwaway save only (castile_start_1444.eu4 copy), game PAUSED.
+Each step: what to run (python: e = Estates(HookClient(), Live(h))), expected result, symptom of a wrong assumption.
+
+== 1. reads (no writes, no game calls with side effects) ==
+1.1 e._estates("CAS")  -> 3 rows (estate_church / estate_nobles / estate_burghers), loyalty/land match the GUI estate screen.
+    Wrong stride 0xc8 or vector offset 0x2198: garbage keys, n != 3, or a read fault (request aborted, game fine).
+    Wrong E_LOYALTY/E_LAND (+0x18/+0x20): numbers off vs the GUI (loyalty usually 30-50 at start, land ~ 30/20/10 %).
+    Influence (GetInfluence sret + GetModifiers(+0x2898)+8): must equal the GUI influence %. Wrong modifier pointer:
+    influence = base value only or absurd; if GetModifiers logs "calculating on other thread" the game log shows it.
+1.2 e.list("CAS")["crown_land"] == 100 - sum(land). Wrong sret use of GetCrownLandShare: value 0 or garbage.
+1.3 e.list("CAS"): granted keys match the GUI privilege icons; grantable keys = the privileges the GUI shows as
+    clickable (green). Wrong T_PRIVS/T_NPRIVS (+0x4f8/+0x504): empty lists or keys of another estate. Wrong
+    PR_KEY: empty strings. CanGrantAndAfford called with a by-value tag instead of a pointer would fault (aborted).
+1.4 e.interactions("CAS") -> sale_of_titles, summon_the_diet, seize_land with can_use as the GUI buttons.
+    Wrong CL_DATA/CL_COUNT/CL_SIZE: no rows or garbage keys. Wrong CL_KEY (+0x18): empty key (then the actions
+    cannot be found by name).
+1.5 active_agenda None at start; offered_agendas [] (no diet pending).
+
+== 2. dry runs (object built, IsValid, deleted; nothing posted) ==
+2.1 e.grant_privilege("CAS", "nobles", <a grantable key>, dry=True) -> valid True.
+    e.grant_privilege("CAS", "nobles", <a granted key>, dry=True) -> valid False.
+    Valid False on a grantable one: field order wrong (+0x48 priv / +0x4c estate index / +0x50 tag), or estate index
+    != [type+0x30]. A crash here = bad base layout or vptr; stop and re-check _tcmd against the GUI lambda @0x1c1d8ce.
+    Leak check: none (del frees the CString and the object).
+2.2 e.revoke_privilege("CAS", "nobles", <granted key>, dry=True) -> valid as can_revoke (False inside the 10-year lock).
+2.3 e.sell_titles / summon_diet / seize_land (dry=True) -> valid == can_use from 1.4. Valid always False: tag at
+    +0x4c (8 bytes) or index at +0x48 wrong.
+
+== 3. posts (one at a time, check the GUI after unpausing one day) ==
+3.1 grant_privilege: icon appears, ADM drops by ESTATE_PRIVILEGE_ADMIN_COST (if >0), loyalty/influence change.
+    Posted but nothing happens: command dropped in CSession (MustSynch / type id 0x397a wrong at +0x3c).
+3.2 revoke_privilege of the same one (after the lock, or on a fresh grant check the refusal message).
+3.3 summon_diet -> pending event estate_privileges_and_agendas_events.3; e.diet_options("CAS") lists the offered
+    estates with agenda keys (cached array +0x21c0). Empty agenda names: AA_AGENDA/AGENDA_KEY wrong.
+3.4 e.choose_agenda("CAS", <offered estate>) -> event answered, window closed, list()["active_agenda"] shows it.
+    Wrong option chosen: option order differs from the file (check _diet_estates()).
+3.5 sell_titles: ducats + estates' land share up, crown land down; then can_use False (60-month cooldown).
+3.6 seize_land: crown land up, loyalty down.

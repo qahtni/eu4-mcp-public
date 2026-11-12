@@ -1,0 +1,8 @@
+{
+  "permissions": { "allow": ["mcp__eu4"] },
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "compact", "hooks": [ { "type": "command", "command": "echo 'Your context was just compacted. Call eu4_notes_brief and eu4_status before giving any order.'" } ] }
+    ]
+  }
+}

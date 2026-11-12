@@ -1,0 +1,44 @@
+Mercenaries (eu4mcp/mercs.py): live prove plan. Throwaway save only (castile_start_1444.eu4 copy, or a 1460+ save so
+that CAS has companies on offer), game PAUSED. NEVER on the campaign while eu4-player is playing.
+Each step: what to run (python: m = Mercs(HookClient(), Live(h))), expected result, symptom of a wrong assumption.
+Open the in-game military tab -> mercenaries next to it to compare by eye.
+
+== 1. reads (no writes; the only game calls are const getters) ==
+1.1 m._companies("CAS") -> same companies, same count as the GUI mercenary list (hired ones included).
+    Wrong array (+0x23f8 data / +0x2404 count): n = 0 or garbage pointers -> read fault (request aborted, game fine).
+    Wrong M_TEMPLATE (+0x20) / T_KEY (+0x18): empty or garbage keys; a fault on `str` aborts the request.
+1.2 m.available("CAS"): name == GUI row title (GetName sret into an empty mkstr). Crash or garbage text here = the
+    sret slot assumption is wrong: STOP. Name with "§" codes stripped. home/home_name = the template's home_province
+    (common/mercenary_companies, e.g. merc_lombard_free_company 4728 Pavia); None for companies with no home.
+1.3 infantry/cavalry/artillery == the three GUI numbers; manpower == the GUI strength (raw = men; if off by 1000,
+    the scale note in hired()/available is wrong). cost == GUI hiring cost, monthly == GUI maintenance.
+    Values 0 or absurd: the sret buffer was read before the call or rdx (country&) is wrong.
+1.4 can_hire matches the GUI hire button (green/grey); why_not == its tooltip reason (not enough money, bankrupt,
+    waiting until <date>, no province in range). can_hire True with a grey button: the bool argument (edx=1) meaning
+    is reversed. Empty why_not on a refused one: PdxLocalizeOptional does not write that reason (cosmetic).
+1.5 m.can_hire_in("CAS", <key>, <owned province>) and with a province out of range -> can True / False + reason.
+    Wrong argument order (country&, province&): fault (aborted) or always False.
+1.6 m.hired("CAS") -> [] at start.
+
+== 2. dry runs (object built, IsValid, deleted; nothing posted) ==
+2.1 m.hire("CAS", <key with can_hire True>, dry=True) -> valid True, province = home or an allowed province.
+    Valid False although can_hire_in is True: ctor argument order wrong (tag, def 0, province id, company) or the
+    company pointer differs from what GetObjectFromID([company+0xc]) returns (check: rd8 company+0xc, then
+    `call @_ZN16CReferenceObject15GetObjectFromIDERK3CID <buf holding that CID>` must return the same pointer).
+    Crash here = wrong size (0x98) or ctor: stop and re-check against CMacroBuildInterface::DoInterfaceBasedSelection.
+2.2 m.hire("CAS", <key with can_hire False>, dry=True) -> valid False, why_not filled.
+2.3 m.hire(..., province=<province where can_hire_in False>, dry=True) -> valid False.
+    Treasury unchanged after every dry run (nothing posted). Leak check: none (del = D0 frees the command).
+
+== 3. posts (one at a time, unpause a few days, check the GUI) ==
+3.1 m.hire("CAS", <hireable key>): treasury drops by `cost` at once; the company leaves available(), hired() shows
+    state "recruiting", unit None; a construction appears in the province (macro build view). After the build time
+    (distance x MERCENARY_COMPANY_BUILDING_TIME) state "hired", unit = the new army id, location = that province,
+    manpower / max_manpower as the army's mercenary reserve in the unit panel, leader = its general (if any).
+    Posted but nothing happens: command dropped (MustSynch / type id 0x2921 at +0x3c); money gone but no army:
+    construction Execute path (merc branch) differs - check CMilitaryConstruction::BuildMercenaryUnit.
+3.2 m.disband("CAS", <key>, dry=True) -> valid True (False in combat: why_not from CanDisbandUnit).
+3.3 m.disband("CAS", <key>) -> army gone; the company returns to available() after its recovery (can_hire False with
+    "waiting until <date>" reason). Army gone but company still "hired": DismissMercenaryCompany not reached via
+    RemoveUnit (then report it; the plain Live.disband behaves the same).
+3.4 Bankruptcy / war exhaustion effects are scripted, not tested here.

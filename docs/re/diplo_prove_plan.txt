@@ -1,0 +1,43 @@
+Live prove plan for eu4mcp/diplo.py (throwaway game, paused, single player). Safest first.
+Setup:  from eu4mcp.hookclient import HookClient; from eu4mcp.diplo import Diplo; d = Diplo(HookClient()); P = "<player>"; T = "<neighbour, not at war>"; E = "<enemy, at war>"
+Each line: call  ->  confirms  |  wrong assumption if ...
+
+A. PURE READS (no object of ours handed to the game except scratch vectors)
+ 1. d._resolve(P, T)                     -> [(ptr, tagvalue)] with tag_str(tagvalue)==P/T  | fault or "unknown country tag": GetCountry / +0x1c wrong
+ 2. d.wars(P)                            -> one row per war in the war overview; attackers/defenders tags, enemy_leader right, warscore = GUI percent (sign from P's side)
+                                            | names empty or tags garbage: CWar +0x20/+0x40/+0x70 wrong; warscore x1000 or always 0: scale/arg order of GetWarScore
+ 3. d.incoming(P)                        -> [] normally; with an AI proposal waiting (e.g. after an AI alliance/RM offer pops up): index, key, from, text
+                                            | fault: CList +0x18c0 / node +0x10 wrong
+ 4. d.war_options(P, T)                  -> the CBs and goals the Declare War dialog lists (cb keys like cb_claim, provinces), names localised
+                                            | empty while the GUI shows CBs: wrong overload or std::function; crash at cleanup: array D2 double free
+ 5. d.actions(P, T)                      -> ~20-60 rows with keys ALLIANCE / IMPROVERELATION / INSULT ...; selectable/why match the diplomacy panel buttons and tooltips
+                                            | fault in the read request: GetTag sret convention; leaks only show as RSS growth (run 50x, compare `ps -o rss`)
+ 6. d.chance(P, T, "alliance")           -> total + reasons equal to the GUI "Will they accept?" tooltip (same values/texts)
+                                            | reasons empty but total != 0: list arg (rsi) wrong; crash on cleanup: CDiploChance size/dtor wrong
+ 7. d.chance(P, T, "send_gift", money=50)  -> acceptance like the gift dialog | setter/CFixedPoint pointer wrong if it differs from money=0
+ 8. d.peace_options(P, E)                -> treaties with type/province/taker/cost matching the peace screen (demand tab); d.peace_options(P, E, demand=False) for the offer tab
+                                            | costs all 0 or x1000: GetWarScoreCost slot/bool; province ids off: CProvince base/size; crash: sizeof(CPeaceOffer) 0x1a0 wrong
+
+B. BUILD + VALIDATE + DELETE, NOTHING POSTED
+ 9. d.send(P, T, "improve_relations", dry=True)       -> selectable True (or the same red reason the button tooltip shows) | token mismatch error: id table wrong
+10. d.send(P, T, "alliance", dry=True); d.send(P, T, "insult", scornful=True, dry=True); d.send(P, T, "send_gift", money=10, dry=True)
+                                                      -> same verdicts as the GUI buttons | crash in insult: GetValidInsults array/vptr
+11. d.send(P, T, "fabricate_claim", province=<T province bordering P>, dry=True)  -> selectable when the GUI would allow it, red reason otherwise
+12. d.declare_war(P, T, "<cb from step 4>", province=<goal province or 0>, dry=True)  -> selectable/why like the DoW button (truce, no CB, ...)
+                                                      | "unknown casus belli": key at CCasusBelliType+0x10 wrong; crash: SetWarGoal / goal ownership
+13. d.peace(P, E, demand=True, treaties=[<index from 8>])   (send=False) -> cost == GUI war score cost of that selection, acceptance/reasons == GUI tooltip
+                                                      | cost differs: SelectTreaty bools or GetWarScoreCost(true); crash at cleanup: CRequestPeaceAction D0
+14. d.peace(P, E, white=True)                          -> cost 0, acceptance as the white-peace tooltip
+
+C. POSTS (each changes the game; verify in the GUI / next autosave)
+15. d.add_rival(P, T)  then  d.remove_rival(P, T)     -> rival appears/disappears in the diplomacy view | "refuses": arg order or IsValid slot 0x48
+16. d.send(P, T, "improve_relations")  then  d.send(P, T, "improve_relations", value=False)   -> diplomat sent / recalled
+17. d.send(P, T, "send_gift", money=<small>)         -> treasury drops, opinion rises next tick | wrong amount: CFixedPoint scale
+18. d.send(P, T, "alliance") to an AI                -> instant AI answer (accept/decline popup) consistent with chance() | nothing happens: Post refused or EType
+19. d.send(P, T, "royal_marriage"); d.send(P, T, "military_access"); d.send(P, T, "embargo") / value=False twins
+20. Wait for an AI proposal (or have an AI offer via console); d.incoming(P) then d.answer(P, 0, accept=False); repeat with accept=True on the next one
+                                                      -> proposal leaves the list, effect applied, list no longer shows it | still listed: EType values / restore order
+21. d.declare_war(P, T, "<cb>", province=<p>)        -> war starts with that goal; call_allies=[ally] on a second test calls the ally
+22. d.peace(P, E, demand=True, treaties=[i], send=True) when chance > 0  -> peace accepted with those terms; force_accept True in the result
+    d.peace(P, E, white=True, send=True)             -> white peace if accepted | "refused": IsGUISelectable cooldown (gs+0x1d6c) or wrong tag order
+23. In a war with an ally: d.send(P, <ally>, "call_to_arms")  -> ally gets the call; check +0x4c handling (AI ally answers)

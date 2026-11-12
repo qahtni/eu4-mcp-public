@@ -1,0 +1,24 @@
+Open modal windows: how Live.open_windows detects them (static RE, 1.37.5; one live read-only check 1459.1.19)
+
+Source: the idler's updateable list (CList of CUpdateable* at CInGameIdler+0x70), the same list Live.close_event_windows walks.
+Every popup is a CUpdateable registered there; its Update() returns false to be dropped.
+
+Vtables (re/vtab.py):
+- CUpdateable primary base (list pointer = object, vptr = _ZTV<class>+16), Update at slot 4, IsEU3Dialog at slot 3:
+    CEventWindow     slot3 = CUpdateable::IsEU3Dialog (not a dialog)
+    CEndOfWarPopup   slot3 = CUpdateable::IsEU3Dialog
+    CMessageDialog   slot3 = CEU3Dialog::IsEU3Dialog   (message popups: the "finance report"-like windows, new heir, colony ...)
+    CDiplomacyDialog, CConfirmDialog, CInfoDialog: slot3 = CEU3Dialog::IsEU3Dialog
+- CNewAgePopup: CUpdateable is a SECONDARY base (second vtable part at _ZTV12CNewAgePopup+0x60, Update thunk at slot 14), so its
+  list pointer is the subobject; vptr-8 is still the typeinfo.
+Rule used: an entry is a popup when its vtable slot 3 (vptr+0x18) == _ZNK10CEU3Dialog11IsEU3DialogEv (every CEU3Dialog
+subclass), or its class is CEventWindow / CEndOfWarPopup / CNewAgePopup. Class name = Itanium typeinfo (vptr-8) -> +8 char*
+(mangled, e.g. "14CMessageDialog"; leading digits stripped).
+
+The vm steps are reads only (idler, clist, rd8, cstr; one write into the hook's own scratch buffer to fetch a symbol address,
+exactly like close_event_windows). Nothing is called.
+
+Live check (read-only, game running): ['CRepayBankLoanDialog'] was open at 1459.1.19 (a loan came due; the dialog waits for an
+answer). Not proven: whether a hidden CEU3Dialog can stay in the list (would be a false positive); no closing is implemented:
+closing a dialog means choosing its answer (repay/extend loan, accept/decline), which must go through the dialog's own
+OnAccept/OnDecline or a command, not proven.

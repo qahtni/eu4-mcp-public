@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "eu4": {
+      "command": "./bin/eu4-mcp",
+      "args": []
+    }
+  }
+}

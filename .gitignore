@@ -1,0 +1,9 @@
+.venv
+re/out/
+__pycache__/
+.pytest_cache/
+*.bak.*
+*.so
+tools/player_prompt.txt
+eu4mcp/vendor/
+config.env

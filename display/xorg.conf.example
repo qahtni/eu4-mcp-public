@@ -1,0 +1,33 @@
+# EXAMPLE ONLY, not used unless you pass it: EU4_XORG_CONF=display/xorg.conf.example tools/display.sh start
+# Written for one machine (NVIDIA GTX 1070 at PCI:1:0:0 with an HDMI dummy plug). Change BusID (lspci), Driver and the mode to fit yours.
+# Without any config file Xorg autodetects, which is the right first try on a machine with a monitor or a dummy plug.
+# Headless X server for EU4 (NVIDIA, HDMI dummy plug).
+Section "ServerLayout"
+    Identifier "eu4"
+    Screen "eu4"
+EndSection
+Section "ServerFlags"
+    Option "AutoAddDevices" "false"
+    Option "BlankTime" "0"
+    Option "StandbyTime" "0"
+    Option "SuspendTime" "0"
+    Option "OffTime" "0"
+EndSection
+Section "Device"
+    Identifier "gtx1070"
+    Driver "nvidia"
+    BusID "PCI:1:0:0"
+EndSection
+# 1440x1080 (4:3) is not in the dummy plug's EDID: custom mode, allowed by ModeValidation.
+Section "Monitor"
+    Identifier "dummy"
+    Modeline "1440x1080_60"  129.00  1440 1528 1680 1920  1080 1083 1087 1120 -hsync +vsync
+EndSection
+Section "Screen"
+    Identifier "eu4"
+    Device "gtx1070"
+    Monitor "dummy"
+    DefaultDepth 24
+    Option "ModeValidation" "AllowNonEdidModes"
+    Option "MetaModes" "1440x1080_60 +0+0"
+EndSection

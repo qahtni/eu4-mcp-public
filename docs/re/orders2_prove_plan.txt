@@ -1,0 +1,33 @@
+Live prove plan for eu4mcp/orders2.py (throwaway game, PAUSED, single player, a colonial nation e.g. POR 1444). Safest first.
+Setup: from eu4mcp.hookclient import HookClient; from eu4mcp.live import Live; from eu4mcp.orders2 import Orders2
+       h = HookClient(); o = Orders2(h, Live(h)); P = "POR". Recruit an explorer + conquistador first (Live.leader, proven).
+Each line: call -> expected | a wrong assumption looks like ...
+
+A. READS (no game state changed; faults abort the request only)
+ 1. o.leaders(P)              -> every leader of the military view; type/pips match tooltips | garbage names: list +0x1458 or name +0x18 wrong; pips swapped: +0x3c..+0x48 order
+ 2. o.explorers(P)            -> fleets/armies with an explorer/conquistador: can_explore True; others listed only if exploring | can_explore always False: CanExplore arg/leader +0xd0
+ 3. o.advisors(P)             -> "available" = court hire list (names, trader/statesman..., skill, cost = GUI cost) | cost x1000 or 0: sret order of GetPurchaseCost; empty: gs+0x1bf0 / pool +0x10 / next +0x18
+ 4. o.envoys(P, 1); o.colonists(P) -> merchant count = top bar, free colonists = top bar | counts swapped: CEnvoy index (0 colonist, 1 merchant) wrong
+ 5. o.trade_nodes(P, mine_only=True) -> home node (lisbon / sevilla) with trader False unless a merchant is there; links = downstream keys | keys empty: CTradeNode stride 0x138 or def +0xa8
+ 6. o.trade_nodes(P)          -> ~80 nodes, index 0..n-1, location = province of the node | if node 0 looks like a dummy, note it (AccessNode refuses 0)
+ 7. o.explore_regions(P, fleet_id) -> sea/coast region keys equal to the GUI "Explore" dialog lists (e.g. west_african_sea) | names '?': region index != CMap+0x510 position; crash later: double free of vectors
+ 8. o.colonisable(P, 20)      -> provinces the colonisation map mode marks (green) and that are unowned; time it (< 1 s expected) | empty: wrong predicate; slow (> 3 s): batch smaller / filter first
+
+B. DRY RUNS (build + IsValid + del, nothing posted; watch RSS over 50 calls for leaks)
+ 9. o.explore(P, fleet, "sea", key, dry=True) -> valid True; with an army unit -> HookError | valid False on a listed region: mission number 2/3 swapped (try "coast")
+10. o.assign_leader(P, explorer_id, fleet_id, dry=True) -> valid True, can_reassign True | False with GUI allowing it: arg order unit/leader
+11. o.hire_advisor(P, adv_id, dry=True) -> valid True; affordable as the GUI button | valid False: CID +0xc wrong
+12. o.send_merchant(P, home_node, "collect", dry=True) -> valid True | False: envoy id +0x44 / province arg
+13. o.colonise(P, prov_from_8, dry=True) -> valid True only for provinces the GUI lets you colonise | always False: ctor bool meaning; True for owned: IsValid not the gate
+
+C. POSTED ORDERS (one at a time, check the GUI after one unpaused day or immediately via the read call)
+14. o.unassign_leader / o.assign_leader(P, explorer, fleet) -> leader moves (leaders() unit field) | nothing: command refused at ProcessCommands
+15. o.hire_advisor(P, id) -> advisor in the court, treasury - cost | money gone but no advisor: slot (=type +0xec) wrong; then o.fire_advisor(P, "DIP") -> slot empty
+16. o.send_merchant(P, node, "collect") -> merchant travelling (envoys busy, trade_nodes trader True after arrival) ; o.recall_merchant(P, node) -> merchant home
+17. o.send_merchant(P, node2, "steer"); o.steer(P, node2, downstream_key) -> trade map arrow / steer_to = link index | steer_to unchanged: link/node index swapped
+18. o.explore(P, fleet, "sea", key) -> fleet mission explore_sea (explorers()), it sails and reveals TI | refused: IsValid region bounds; o.stop_mission(P, fleet) -> mission 0
+19. o.explore(P, conq_army, "land") -> mission explore_land; same call again toggles off | crash/no-op: land id must be the location province (>0)
+20. o.colonise(P, prov) -> colonist en route (colonisable has_colonist True), o.recall_colonist(P, prov) -> colonist back | IsValid False: CColonyConstruction gate
+21. Movement (Live.move, no new code): fleet to a discovered sea zone -> moves; army onto a sea zone holding its own transports -> boards;
+    fleet with explorer into terra incognita -> Live.move refuses (IsLegalToMove TI check) - use explore(); army to overseas land -> GUI
+    auto-transport dialog (CMoveAutoFleetTransportDialog), not a move: board manually (army -> fleet's sea zone, fleet -> coast, army -> land).
